@@ -126,8 +126,9 @@ export function usePoseDetection(
       // tfjs-tflite hat eigene WASM-Binaries (getrennt vom backend-wasm).
       // Pfad einmalig auf jsDelivr setzen, damit _malloc verfügbar wird.
       if (window.tflite.setWasmPath) {
+        // alpha.9 enthält die .wasm-Binaries; alpha.10 nicht
         window.tflite.setWasmPath(
-          "https://cdn.jsdelivr.net/npm/@tensorflow/tfjs-tflite@0.0.1-alpha.10/dist/",
+          "https://cdn.jsdelivr.net/npm/@tensorflow/tfjs-tflite@0.0.1-alpha.9/dist/",
         );
       }
       const model = await window.tflite.loadTFLiteModel(
