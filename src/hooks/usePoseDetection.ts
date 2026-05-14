@@ -1,8 +1,22 @@
 import { useState, useEffect, useRef, useCallback } from "react";
 import * as poseDetection from "@tensorflow-models/pose-detection";
-import * as tflite from "@tensorflow/tfjs-tflite";
 import * as tf from "@tensorflow/tfjs-core";
 import "@tensorflow/tfjs-backend-wasm";
+
+// tfjs-tflite wird als UMD-Script in index.html geladen (ESM-Import scheitert
+// wegen fehlender Submodule). Stellt window.tflite bereit.
+interface TFLiteModelLike {
+  predict: (input: tf.Tensor | tf.Tensor[]) => tf.Tensor | tf.Tensor[];
+}
+interface TFLiteGlobal {
+  loadTFLiteModel: (url: string) => Promise<TFLiteModelLike>;
+  setWasmPath?: (path: string) => void;
+}
+declare global {
+  interface Window {
+    tflite?: TFLiteGlobal;
+  }
+}
 import {
   QuantizationLevel,
   TFLITE_MODEL_URLS,
@@ -28,7 +42,7 @@ export interface LastMeasurement {
 }
 
 export interface UsePoseDetectionResult {
-  detector: tflite.TFLiteModel | null;
+  detector: TFLiteModelLike | null;
   poses: Pose[];
   metrics: PoseMetrics;
   isLoading: boolean;
@@ -47,7 +61,7 @@ export interface UsePoseDetectionResult {
 export function usePoseDetection(
   initialLevel: QuantizationLevel = "fp32",
 ): UsePoseDetectionResult {
-  const [detector, setDetector] = useState<tflite.TFLiteModel | null>(null);
+  const [detector, setDetector] = useState<TFLiteModelLike | null>(null);
   const [poses, setPoses] = useState<Pose[]>([]);
   const [isLoading, setIsLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -99,7 +113,14 @@ export function usePoseDetection(
         return null;
       });
 
-      const model = await tflite.loadTFLiteModel(TFLITE_MODEL_URLS[level]);
+      if (!window.tflite) {
+        throw new Error(
+          "window.tflite nicht verfügbar — UMD-Script in index.html prüfen",
+        );
+      }
+      const model = await window.tflite.loadTFLiteModel(
+        TFLITE_MODEL_URLS[level],
+      );
 
       levelRef.current = level;
       setCurrentLevel(level);
