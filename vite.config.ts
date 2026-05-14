@@ -8,14 +8,8 @@ export default defineConfig({
     port: 5173,
   },
   optimizeDeps: {
-    // tfjs-tflite lädt einen WASM-Client lazy aus eigenem Bundle — esbuild muss prebundle ausführen
-    include: ['@tensorflow/tfjs-tflite'],
-  },
-  build: {
-    rollupOptions: {
-      // Internes Lazy-Modul von tfjs-tflite kann Rollup nicht statisch auflösen.
-      // Externalisieren — Browser lädt es zur Laufzeit aus dem geshippten dist-Folder.
-      external: [/tflite_web_api_client/],
-    },
+    // tfjs-tflite ist UMD-only — wird via <script>-Tag in index.html geladen,
+    // nicht als ESM-Modul gebundelt. Esbuild soll es nicht anfassen.
+    exclude: ['@tensorflow/tfjs-tflite'],
   },
 });
