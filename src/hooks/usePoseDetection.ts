@@ -17,6 +17,26 @@ declare global {
     tflite?: TFLiteGlobal;
   }
 }
+
+const TFLITE_UMD_URL =
+  "https://cdn.jsdelivr.net/npm/@tensorflow/tfjs-tflite@0.0.1-alpha.9/dist/tf-tflite.min.js";
+
+let tfliteScriptPromise: Promise<void> | null = null;
+
+function loadTFLiteScript(): Promise<void> {
+  if (window.tflite) return Promise.resolve();
+  if (tfliteScriptPromise) return tfliteScriptPromise;
+  tfliteScriptPromise = new Promise((resolve, reject) => {
+    const script = document.createElement("script");
+    script.src = TFLITE_UMD_URL;
+    script.async = true;
+    script.onload = () => resolve();
+    script.onerror = () =>
+      reject(new Error("TFLite UMD-Bundle konnte nicht geladen werden"));
+    document.head.appendChild(script);
+  });
+  return tfliteScriptPromise;
+}
 import {
   QuantizationLevel,
   TFLITE_MODEL_URLS,
@@ -100,6 +120,14 @@ export function usePoseDetection(
         );
         await tf.setBackend("wasm");
         await tf.ready();
+
+        // window.tf MUSS gesetzt sein, BEVOR das tfjs-tflite UMD lädt
+        // — die UMD-Factory captured tf bei der ersten Auswertung.
+        (window as unknown as { tf: typeof tf }).tf = tf;
+
+        // tfjs-tflite UMD dynamisch nachladen
+        await loadTFLiteScript();
+
         backendReadyRef.current = true;
         console.log("TensorFlow.js Backend:", tf.getBackend());
       }
