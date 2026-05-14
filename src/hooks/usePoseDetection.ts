@@ -1,7 +1,7 @@
 import { useState, useEffect, useRef, useCallback } from "react";
 import * as poseDetection from "@tensorflow-models/pose-detection";
 import * as tf from "@tensorflow/tfjs-core";
-import "@tensorflow/tfjs-backend-wasm";
+import { setWasmPaths } from "@tensorflow/tfjs-backend-wasm";
 
 // tfjs-tflite wird als UMD-Script in index.html geladen (ESM-Import scheitert
 // wegen fehlender Submodule). Stellt window.tflite bereit.
@@ -94,6 +94,10 @@ export function usePoseDetection(
 
       // Backend nur einmal initialisieren
       if (!backendReadyRef.current) {
+        // WASM-Binaries vom jsDelivr-CDN laden (Vite serviert sie sonst nicht)
+        setWasmPaths(
+          "https://cdn.jsdelivr.net/npm/@tensorflow/tfjs-backend-wasm@4.22.0/dist/",
+        );
         await tf.setBackend("wasm");
         await tf.ready();
         backendReadyRef.current = true;
@@ -116,6 +120,14 @@ export function usePoseDetection(
       if (!window.tflite) {
         throw new Error(
           "window.tflite nicht verfügbar — UMD-Script in index.html prüfen",
+        );
+      }
+
+      // tfjs-tflite hat eigene WASM-Binaries (getrennt vom backend-wasm).
+      // Pfad einmalig auf jsDelivr setzen, damit _malloc verfügbar wird.
+      if (window.tflite.setWasmPath) {
+        window.tflite.setWasmPath(
+          "https://cdn.jsdelivr.net/npm/@tensorflow/tfjs-tflite@0.0.1-alpha.10/dist/",
         );
       }
       const model = await window.tflite.loadTFLiteModel(
