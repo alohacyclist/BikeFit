@@ -1,4 +1,6 @@
 import { QuantizationLevel } from '../types/quantization';
+import type { BodySide } from '../utils/AngleCalculator';
+import type { ThreadingPreference } from '../hooks/usePoseDetection';
 
 interface QuantizationControlsProps {
   currentLevel: QuantizationLevel;
@@ -8,9 +10,20 @@ interface QuantizationControlsProps {
   participantId: string;
   onParticipantIdChange: (id: string) => void;
   onExport: () => void;
+
+  /** Side-Lock — Studienleiter setzt fest vor Messung. */
+  forcedSide: BodySide;
+  onForcedSideChange: (side: BodySide) => void;
+
+  /** Threading-Konfiguration. */
+  threadingPreference: ThreadingPreference;
+  onThreadingPreferenceChange: (mode: ThreadingPreference) => void;
+  multiThreadingAvailable: boolean;
+  activeThreadingMode: 'single' | 'multi' | 'unknown';
 }
 
 const LEVELS: QuantizationLevel[] = ['fp32', 'fp16', 'int8'];
+const SIDES: BodySide[] = ['left', 'right'];
 
 export function QuantizationControls({
   currentLevel,
@@ -20,11 +33,18 @@ export function QuantizationControls({
   participantId,
   onParticipantIdChange,
   onExport,
+  forcedSide,
+  onForcedSideChange,
+  threadingPreference,
+  onThreadingPreferenceChange,
+  multiThreadingAvailable,
+  activeThreadingMode,
 }: QuantizationControlsProps) {
   const disabled = isLoading || isWarmingUp;
 
   return (
-    <div className="bg-gray-800/60 rounded-lg p-4 border border-gray-700 space-y-3">
+    <div className="bg-gray-800/60 rounded-lg p-4 border border-gray-700 space-y-4">
+      {/* Quantisierung */}
       <div>
         <h3 className="text-sm font-semibold text-gray-300 mb-2">
           Quantisierungsstufe
@@ -50,6 +70,84 @@ export function QuantizationControls({
         </div>
       </div>
 
+      {/* Side-Lock */}
+      <div>
+        <h3 className="text-sm font-semibold text-gray-300 mb-2">
+          Körperseite (fix)
+        </h3>
+        <div className="grid grid-cols-2 gap-2">
+          {SIDES.map((side) => {
+            const active = forcedSide === side;
+            return (
+              <button
+                key={side}
+                onClick={() => onForcedSideChange(side)}
+                disabled={disabled}
+                className={`py-2 px-3 rounded-md text-sm font-semibold transition-colors ${
+                  active
+                    ? 'bg-yellow-500 text-black border border-yellow-300'
+                    : 'bg-gray-700 text-gray-300 border border-gray-600 hover:bg-gray-600'
+                } ${disabled ? 'opacity-50 cursor-not-allowed' : ''}`}
+              >
+                {side === 'left' ? 'Links' : 'Rechts'}
+              </button>
+            );
+          })}
+        </div>
+        <p className="text-xs text-gray-500 mt-1">
+          Muss mit der Seite übereinstimmen, die in der GT-Software
+          ausgewertet wird.
+        </p>
+      </div>
+
+      {/* Threading */}
+      <div>
+        <h3 className="text-sm font-semibold text-gray-300 mb-2">
+          WASM-Threading
+        </h3>
+        <div className="grid grid-cols-2 gap-2">
+          <button
+            onClick={() => onThreadingPreferenceChange('single')}
+            disabled={disabled}
+            className={`py-2 px-3 rounded-md text-sm font-semibold transition-colors ${
+              threadingPreference === 'single'
+                ? 'bg-purple-600 text-white border border-purple-400'
+                : 'bg-gray-700 text-gray-300 border border-gray-600 hover:bg-gray-600'
+            } ${disabled ? 'opacity-50 cursor-not-allowed' : ''}`}
+          >
+            Single
+          </button>
+          <button
+            onClick={() => onThreadingPreferenceChange('multi')}
+            disabled={disabled || !multiThreadingAvailable}
+            className={`py-2 px-3 rounded-md text-sm font-semibold transition-colors ${
+              threadingPreference === 'multi'
+                ? 'bg-purple-600 text-white border border-purple-400'
+                : 'bg-gray-700 text-gray-300 border border-gray-600 hover:bg-gray-600'
+            } ${
+              disabled || !multiThreadingAvailable
+                ? 'opacity-50 cursor-not-allowed'
+                : ''
+            }`}
+          >
+            Multi
+          </button>
+        </div>
+        <p className="text-xs text-gray-500 mt-1">
+          {!multiThreadingAvailable && (
+            <>
+              Multi-Threading nicht verfügbar (SharedArrayBuffer fehlt — COOP/COEP-Header nicht gesetzt).{' '}
+            </>
+          )}
+          Aktiv:{' '}
+          <span className="font-mono text-gray-300">
+            {activeThreadingMode}
+          </span>
+          . Änderung wirkt nach Reload des Modells.
+        </p>
+      </div>
+
+      {/* Probanden-ID */}
       <div>
         <label className="block text-xs text-gray-400 mb-1">
           Teilnehmer-ID
@@ -63,7 +161,6 @@ export function QuantizationControls({
         />
       </div>
 
-      {/* Warmup-Indikator */}
       {isWarmingUp && (
         <div className="flex items-center gap-2 bg-yellow-900/40 border border-yellow-700/50 rounded-md px-3 py-2">
           <span className="w-2 h-2 rounded-full bg-yellow-400 animate-pulse" />
@@ -77,7 +174,6 @@ export function QuantizationControls({
         <div className="text-xs text-gray-400">Modell wird geladen...</div>
       )}
 
-      {/* Export-Button — nur aktiv wenn nicht im Warmup */}
       <button
         onClick={onExport}
         disabled={isWarmingUp}
