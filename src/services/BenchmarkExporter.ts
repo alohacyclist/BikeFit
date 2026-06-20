@@ -22,6 +22,10 @@ interface SystemInfo {
   userAgent: string;
   hardwareConcurrency: number;
   deviceMemory?: number;
+  /** Vom Browser gemeldete Cross-Origin-Isolation (Voraussetzung für SAB). */
+  crossOriginIsolated: boolean;
+  /** Ob SharedArrayBuffer im aktuellen Kontext definiert ist. */
+  sharedArrayBufferAvailable: boolean;
 }
 
 export interface ValidationMetrics {
@@ -42,6 +46,8 @@ export interface BenchmarkSession {
   lockedSide: BodySide | null; // welche Körperseite getrackt wurde
   modelFingerprint: ModelFingerprint | null;
   threadingMode: "single" | "multi" | "unknown";
+  /** Tatsächlich an TFLite übergebener numThreads-Parameter. */
+  numThreads: number | null;
   videoSource: "webcam" | "file";
   videoSourceName?: string;
   frames: FrameMeasurement[];
@@ -64,10 +70,16 @@ import { WARMUP_FRAMES } from "../types/quantization";
 
 function collectSystemInfo(): SystemInfo {
   const navAny = navigator as Navigator & { deviceMemory?: number };
+  const coi =
+    typeof self !== "undefined" &&
+    (self as unknown as { crossOriginIsolated?: boolean })
+      .crossOriginIsolated === true;
   return {
     userAgent: navigator.userAgent,
     hardwareConcurrency: navigator.hardwareConcurrency ?? 0,
     deviceMemory: navAny.deviceMemory,
+    crossOriginIsolated: coi,
+    sharedArrayBufferAvailable: typeof SharedArrayBuffer !== "undefined",
   };
 }
 
@@ -111,9 +123,15 @@ export class BenchmarkExporter {
       lockedSide: null,
       modelFingerprint: null,
       threadingMode: "unknown",
+      numThreads: null,
       videoSource: "webcam",
       frames: [],
     };
+  }
+
+  setNumThreads(n: number | null): void {
+    if (!this.session) return;
+    this.session.numThreads = n;
   }
 
   setLockedSide(side: BodySide): void {

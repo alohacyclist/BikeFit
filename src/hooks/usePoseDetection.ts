@@ -8,8 +8,14 @@ import { setWasmPaths } from "@tensorflow/tfjs-backend-wasm";
 interface TFLiteModelLike {
   predict: (input: tf.Tensor | tf.Tensor[]) => tf.Tensor | tf.Tensor[];
 }
+interface TFLiteLoadOptions {
+  numThreads?: number;
+}
 interface TFLiteGlobal {
-  loadTFLiteModel: (url: string) => Promise<TFLiteModelLike>;
+  loadTFLiteModel: (
+    url: string,
+    options?: TFLiteLoadOptions,
+  ) => Promise<TFLiteModelLike>;
   setWasmPath?: (path: string) => void;
 }
 declare global {
@@ -76,6 +82,8 @@ export interface UsePoseDetectionResult {
   detectPose: (video: HTMLVideoElement) => Promise<Pose | null>;
   loadModel: (level: QuantizationLevel) => Promise<void>;
   resetBackend: () => Promise<void>;
+  /** Startet das Warmup-Fenster für die kommende Aufnahme neu. */
+  beginWarmup: () => void;
   currentLevel: QuantizationLevel;
   isWarmingUp: boolean;
   lastMeasurementRef: React.MutableRefObject<LastMeasurement | null>;
@@ -88,6 +96,8 @@ export interface UsePoseDetectionResult {
   multiThreadingAvailable: boolean;
   /** Effektiver Modus nach Backend-Init. */
   activeThreadingMode: "single" | "multi" | "unknown";
+  /** Tatsächlich an TFLite übergebener numThreads-Wert (null vor erstem Load). */
+  activeNumThreads: number | null;
 }
 
 /**
@@ -106,13 +116,21 @@ export function usePoseDetection(
   const [isWarmingUp, setIsWarmingUp] = useState(true);
   const [modelFingerprint, setModelFingerprint] =
     useState<ModelFingerprint | null>(null);
-  // SharedArrayBuffer existiert nur mit COOP/COEP-Headern.
-  const multiThreadingAvailable = typeof SharedArrayBuffer !== "undefined";
+  // Echte Multi-Threading-Verfügbarkeit: SharedArrayBuffer + Cross-Origin-Isolation.
+  // Beides muss zur Laufzeit existieren — sonst startet die Pthread-Workerpool von
+  // WASM erst gar nicht. crossOriginIsolated wird vom Browser nur gesetzt, wenn
+  // die richtigen COOP/COEP-Header geliefert werden.
+  const multiThreadingAvailable =
+    typeof SharedArrayBuffer !== "undefined" &&
+    typeof self !== "undefined" &&
+    (self as unknown as { crossOriginIsolated?: boolean })
+      .crossOriginIsolated === true;
   const [threadingPreference, setThreadingPreference] =
     useState<ThreadingPreference>(multiThreadingAvailable ? "multi" : "single");
   const [activeThreadingMode, setActiveThreadingMode] = useState<
     "single" | "multi" | "unknown"
   >("unknown");
+  const [activeNumThreads, setActiveNumThreads] = useState<number | null>(null);
   const [metrics, setMetrics] = useState<PoseMetrics>({
     inferenceTime: 0,
     fps: 0,
@@ -145,6 +163,22 @@ export function usePoseDetection(
     }
   }, []);
 
+  /**
+   * Startet das Warmup-Fenster neu: die ersten WARMUP_FRAMES Inferenzen der
+   * kommenden Aufnahme werden als isWarmup=true markiert (Postprocessing
+   * filtert sie heraus). MUSS bei Aufnahmestart aufgerufen werden — sonst
+   * verbraucht der Setup/Countdown-Preview-Loop das Warmup-Budget bereits
+   * vor der Aufnahme, und kein aufgezeichneter Frame trägt das Flag.
+   * Setzt zugleich Frame-Zähler und FPS-Fenster zurück, damit frameIndex
+   * und fps pro Aufnahme sauber bei null beginnen.
+   */
+  const beginWarmup = useCallback(() => {
+    warmupCounterRef.current = 0;
+    frameCountRef.current = 0;
+    frameTimestamps.current = [];
+    setIsWarmingUp(true);
+  }, []);
+
   // Modell laden (auch bei Level-Wechsel aufrufbar)
   const loadModel = useCallback(async (level: QuantizationLevel) => {
     try {
@@ -157,8 +191,9 @@ export function usePoseDetection(
 
       // Backend nur einmal initialisieren
       if (!backendReadyRef.current) {
-        // Threading-Präferenz VOR setBackend setzen — sonst greift sie nicht.
-        // SharedArrayBuffer braucht COOP/COEP-Header; sonst Fallback single.
+        // Threading-Hint für tfjs-backend-wasm setzen (beeinflusst nur tfjs-eigene
+        // Ops, NICHT die TFLite-Inferenz — diese läuft über tfjs-tflite und
+        // wird unten via loadTFLiteModel({numThreads}) konfiguriert).
         const wantMulti =
           threadingPreference === "multi" && multiThreadingAvailable;
         tf.env().set("WASM_HAS_MULTITHREAD_SUPPORT", wantMulti);
@@ -171,13 +206,6 @@ export function usePoseDetection(
         await tf.setBackend("wasm");
         await tf.ready();
 
-        const effective = (tf
-          .env()
-          .get("WASM_HAS_MULTITHREAD_SUPPORT") as boolean)
-          ? "multi"
-          : "single";
-        setActiveThreadingMode(effective);
-
         // window.tf MUSS gesetzt sein, BEVOR das tfjs-tflite UMD lädt
         // — die UMD-Factory captured tf bei der ersten Auswertung.
         (window as unknown as { tf: typeof tf }).tf = tf;
@@ -189,8 +217,8 @@ export function usePoseDetection(
         console.log(
           "TensorFlow.js Backend:",
           tf.getBackend(),
-          "Threading:",
-          effective,
+          "crossOriginIsolated:",
+          multiThreadingAvailable,
         );
       }
 
@@ -221,14 +249,54 @@ export function usePoseDetection(
           "https://cdn.jsdelivr.net/npm/@tensorflow/tfjs-tflite@0.0.1-alpha.9/dist/",
         );
       }
-      // Modell-Fingerprint parallel berechnen (zweiter fetch trifft Browser-Cache)
-      const [model, fingerprint] = await Promise.all([
-        window.tflite.loadTFLiteModel(TFLITE_MODEL_URLS[level]),
-        fingerprintModel(TFLITE_MODEL_URLS[level]).catch((e) => {
-          console.warn("Fingerprint fehlgeschlagen:", e);
-          return null;
-        }),
-      ]);
+      // numThreads für TFLite-Runtime — nur wenn Multi-Threading wirklich
+      // verfügbar UND vom Nutzer gewünscht. Sonst single-thread.
+      // Cap bei 4: tfjs-MT-Speedup ist sublinear, höhere Werte bringen
+      // wegen Synchronisations-Overhead bei kleinen Modellen nichts.
+      const useMulti =
+        threadingPreference === "multi" && multiThreadingAvailable;
+      const numThreads = useMulti
+        ? Math.min(navigator.hardwareConcurrency || 4, 4)
+        : 1;
+
+      // Modell-Fingerprint parallel berechnen (zweiter fetch trifft Browser-Cache).
+      // Fail-Safe: falls TFLite mit numThreads scheitert (z.B. weil Pthread-Pool
+      // nicht initialisiert werden kann), Retry mit numThreads=1.
+      let model: TFLiteModelLike;
+      let actuallyMulti = useMulti;
+      try {
+        model = await window.tflite.loadTFLiteModel(TFLITE_MODEL_URLS[level], {
+          numThreads,
+        });
+      } catch (e) {
+        if (useMulti) {
+          console.warn(
+            "TFLite Multi-Thread-Load fehlgeschlagen, Fallback auf Single:",
+            e,
+          );
+          actuallyMulti = false;
+          model = await window.tflite.loadTFLiteModel(
+            TFLITE_MODEL_URLS[level],
+            {
+              numThreads: 1,
+            },
+          );
+        } else {
+          throw e;
+        }
+      }
+      const fingerprint = await fingerprintModel(
+        TFLITE_MODEL_URLS[level],
+      ).catch((e) => {
+        console.warn("Fingerprint fehlgeschlagen:", e);
+        return null;
+      });
+
+      // activeThreadingMode jetzt anhand des TATSÄCHLICH genutzten Pfads setzen,
+      // nicht anhand der vorher gesetzten Flag (tautologisch).
+      const realNumThreads = actuallyMulti ? numThreads : 1;
+      setActiveThreadingMode(actuallyMulti ? "multi" : "single");
+      setActiveNumThreads(realNumThreads);
 
       levelRef.current = level;
       setCurrentLevel(level);
@@ -392,6 +460,7 @@ export function usePoseDetection(
     detectPose,
     loadModel,
     resetBackend,
+    beginWarmup,
     currentLevel,
     isWarmingUp,
     lastMeasurementRef,
@@ -400,5 +469,6 @@ export function usePoseDetection(
     setThreadingPreference,
     multiThreadingAvailable,
     activeThreadingMode,
+    activeNumThreads,
   };
 }
