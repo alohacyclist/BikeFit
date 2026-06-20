@@ -23,32 +23,6 @@ const TFLITE_UMD_URL =
 
 let tfliteScriptPromise: Promise<void> | null = null;
 
-/**
- * Aufwärm-Inferenzen mit Dummy-Tensor (Nullen, korrekter dtype/shape).
- * Triggert JIT, WASM-Cache, Allocator-Pools — sodass spätere reale Inferenzen
- * stabile Latenzen liefern. Unabhängig vom UI-Render-Loop.
- */
-async function runDummyWarmup(
-  model: TFLiteModelLike,
-  level: QuantizationLevel,
-): Promise<void> {
-  const shape: [number, number, number, number] = [
-    1,
-    MODEL_INPUT_SIZE,
-    MODEL_INPUT_SIZE,
-    3,
-  ];
-  const dummy = tf.tidy(() =>
-    level === "int8" ? tf.zeros(shape, "int32") : tf.zeros(shape, "float32"),
-  );
-  for (let i = 0; i < WARMUP_FRAMES; i++) {
-    const out = model.predict(dummy) as tf.Tensor;
-    await out.data();
-    out.dispose();
-  }
-  dummy.dispose();
-}
-
 function loadTFLiteScript(): Promise<void> {
   if (window.tflite) return Promise.resolve();
   if (tfliteScriptPromise) return tfliteScriptPromise;
@@ -259,20 +233,14 @@ export function usePoseDetection(
       levelRef.current = level;
       setCurrentLevel(level);
       setModelFingerprint(fingerprint);
-
-      // Auto-Warmup mit Dummy-Tensoren — entkoppelt vom UI-Render-Loop,
-      // damit isWarmingUp auch beim Modell-Wechsel ohne aktive Aufnahme
-      // wieder false wird.
-      try {
-        await runDummyWarmup(model, level);
-      } catch (e) {
-        console.warn("Dummy-Warmup fehlgeschlagen:", e);
-      }
-
       setDetector(model);
       setIsLoading(false);
+
+      // Modell ist geladen — UI-State "einsatzbereit" sofort setzen.
+      // Der per-Frame isWarmup-Flag (warmupCounterRef in detectPose) markiert
+      // die ersten WARMUP_FRAMES realen Inferenzen weiterhin als Warmup im
+      // JSON-Export. Postprocessing in Python filtert diese aus.
       setIsWarmingUp(false);
-      warmupCounterRef.current = WARMUP_FRAMES; // bereits aufgewärmt
       console.log(`TFLite-Modell geladen (${level})`);
     } catch (err) {
       const message =
@@ -358,12 +326,11 @@ export function usePoseDetection(
 
         const pose: Pose = { keypoints };
 
-        // Warmup-Phase
+        // Per-Frame Warmup-Flag — markiert die ersten WARMUP_FRAMES realen
+        // Inferenzen für das Postprocessing-Filter in Python.
+        // UI-State (isWarmingUp) wird NICHT mehr hier gesetzt — siehe loadModel.
         warmupCounterRef.current += 1;
         const inWarmup = warmupCounterRef.current <= WARMUP_FRAMES;
-        if (!inWarmup && isWarmingUp) {
-          setIsWarmingUp(false);
-        }
 
         // FPS — gleitender Durchschnitt der letzten 30 Frames
         const now = performance.now();
@@ -413,7 +380,7 @@ export function usePoseDetection(
         return null;
       }
     },
-    [detector, isWarmingUp],
+    [detector],
   );
 
   return {
