@@ -1,132 +1,132 @@
 # EdgeFit Pro — KI-Übersicht
 
-Bachelorarbeit-POC. React + TS + Vite + Tailwind. Browser-only Bike-Fitting via TensorFlow.js **TFLite** MoveNet (Lightning, WASM-Backend) mit **3 Quantisierungsstufen (fp32 / fp16 / int8)** für Performance-Benchmarks. 100% lokal, kein Backend.
+Bachelorarbeit-POC. React + TS + Vite + Tailwind. Browser-only Kniewinkel-Messung via TensorFlow.js **TFLite** MoveNet (Lightning, WASM-Backend) mit **3 Quantisierungsstufen (fp32 / fp16 / int8)** für Performance-Benchmarks. Ground-Truth-Validierung gegen externe 2D-Video-Analyse-Software.
+
+**Scope:** ausschließlich Kniewinkel (Hüfte / Knöchel / Ellbogen / Rücken bewusst entfernt). Studienleiter-getriebene Datensammlung, Auswertung extern in Python.
 
 ## Stack
 - React 18 + TypeScript 5 + Vite 6 + TailwindCSS 3
-- `@tensorflow/tfjs-tflite` (^0.0.1-alpha.10) — TFLite Modell-Loader
-- `@tensorflow/tfjs-backend-wasm` (^4.22.0) — Inferenz-Backend
-- `@tensorflow/tfjs-core` / `tfjs-converter` (^4.22.0)
-- `@tensorflow-models/pose-detection` (^2.1.3) — nur noch als Typ-Quelle (`Pose`, `Keypoint`)
-- Persistenz: `localStorage` (key `edgefit_history`, max 20 Einträge) + Benchmark-JSON-Download
-
-> Hinweis: `npm install` benötigt `--legacy-peer-deps`, da `tfjs-tflite@0.0.1-alpha.x` einen veralteten Peer auf `tfjs-core@4.9.0` deklariert.
+- `@tensorflow/tfjs-tflite` **0.0.1-alpha.9** (exakt gepinnt — alpha.10 fehlt WASM-Binaries)
+- `@tensorflow/tfjs-backend-wasm` 4.22.0 + `tfjs-core` 4.22.0
+- `@tensorflow-models/pose-detection` 2.1.3 (nur Typen)
+- Persistenz: JSON-Download pro Session
 
 ## Scripts
-- `npm run dev` — Vite Dev-Server
-- `npm run build` — `tsc -b && vite build`
-- `npm run preview`
+- `npm run dev` — Vite Dev-Server (**nicht für Messungen — siehe unten**)
+- `npm run build` — Production Build
+- `npm run preview` — serviert `dist/` Build (Mess-Modus)
+- `npm run measure` — `build` + `preview` in einem Schritt mit `--host`
 
-## Vite-Konfiguration (`vite.config.ts`)
-- `optimizeDeps.include: ['@tensorflow/tfjs-tflite']` — esbuild-Prebundle erzwingen.
-- `build.rollupOptions.external: [/tflite_web_api_client/]` — internes Lazy-Modul von tfjs-tflite, das Rollup nicht statisch auflösen kann. Wird zur Laufzeit aus `node_modules/@tensorflow/tfjs-tflite/dist/` gezogen.
+## Messmodus — wichtig
 
-## Datenfluss
+Messungen ausschließlich gegen `npm run measure` (= `vite build && vite preview`) ausführen, **niemals gegen `npm run dev`**. Im Dev-Modus laufen HMR, Source-Maps und ein WebSocket-Watcher, die GC-Pausen verursachen und die Inferenzlatenz-Messung um zweistellige Prozentpunkte verzerren können.
+
+## Vite-Konfiguration
+- `optimizeDeps.exclude: ['@tensorflow/tfjs-tflite']` — Paket UMD-only.
+- TFLite-UMD wird zur Laufzeit dynamisch geladen (nach `window.tf = tf`).
+
+## Architektur — Datenfluss
 ```
-Webcam → <video> → usePoseDetection (TFLite + WASM) → Pose (17 keypoints)
-  ├─→ VideoCanvas (Skeleton overlay, Live-Winkel)         [home view]
-  └─→ AnalysisView (sammelt 5 Pedalzyklen)
-        ├─→ BiomechanicalAnalyzer → AnalysisResults
-        │     → RecommendationsEngine → RecommendationReport
-        │     → ResultsDashboard + HistoryStorage → localStorage
-        │     → HistoryView
-        └─→ onFrameMeasurement(pose)
-              → App.handleFrameMeasurement
-              → benchmarkExporter.recordFrame(...)
-              → JSON-Export (Browser-Download)
+Video-Quelle (Webcam | Datei-Replay)
+  → <video> Element (gesteuert via useVideoSource)
+  → detectPose(video) → Pose (17 keypoints)
+  → AnalysisView → BiomechanicalAnalyzer (Pedalzyklus-FSM)
+  → onFrameMeasurement → benchmarkExporter.recordFrame
+  → JSON-Export (Browser-Download) → Python-Postprocessing
 ```
 
 ## Datei-Map (`src/`)
 
-### Code
 | Datei | Rolle |
 |---|---|
 | `main.tsx` | React-Mount |
-| `App.tsx` | View-Router (`home\|analysis\|results\|history`), Hook-Konsument, Benchmark-Verdrahtung, Level-Wechsel, Frame-Recording |
-| `hooks/usePoseDetection.ts` | **Neu:** TFLite-Loader (`loadModel(level)`), WASM-Backend, `detectPose(video) → Pose\|null`, Warmup-Tracking (30 Frames), `lastMeasurementRef` für synchronen Frame-Snapshot, sauberes Tensor-Cleanup |
-| `components/VideoCanvas.tsx` | Webcam + Canvas-Overlay (Live-Preview, home view) |
-| `components/AnalysisView.tsx` | Erfassungs-UI (5 Zyklen), ruft `detectPose` pro Frame, leitet via `onFrameMeasurement(pose)` weiter |
-| `components/QuantizationControls.tsx` | **Neu:** FP32/FP16/INT8-Buttons, Teilnehmer-ID-Input, Warmup-Badge, JSON-Export-Button |
-| `components/MetricsOverlay.tsx` | Live-Metriken Sidebar (FPS, Inferenzzeit) |
-| `components/ResultsDashboard.tsx` | Ergebnis-Visualisierung + Empfehlungen |
-| `components/HistoryView.tsx` | Verlaufsliste |
-| `services/BiomechanicalAnalyzer.ts` | Pedalzyklus-Detektor (FSM `searching→extension→flexion`), Statistik, Singleton |
-| `services/RecommendationsEngine.ts` | `generateRecommendations(results)` → priorisierte Empfehlungen |
-| `services/HistoryStorage.ts` | `saveToHistory`, `loadHistory` (rawCycles werden NICHT gespeichert) |
-| `services/BenchmarkExporter.ts` | **Neu:** Singleton, sammelt `FrameMeasurement[]`, exportiert `BenchmarkSession` als JSON-Download |
-| `utils/AngleCalculator.ts` | Vektor-Winkel, `OPTIMAL_RANGES`, `evaluateAngle` |
-| `types/quantization.ts` | **Neu:** `QuantizationLevel`, `TFLITE_MODEL_URLS`, `KP`-Indizes, `KEYPOINT_NAMES`, `WARMUP_FRAMES=30`, `MODEL_INPUT_SIZE=192` |
+| `App.tsx` | Single-View-Layout, hält Settings, verdrahtet alle Hooks |
+| `hooks/usePoseDetection.ts` | TFLite-Loader, `loadModel` / `resetBackend`, SHA-256-Fingerprint, Threading-Setting, Warmup, `detectPose(video) → Pose` |
+| `hooks/useVideoSource.ts` | Abstraktion Webcam ↔ Datei für `<video>`-Element |
+| `components/AnalysisView.tsx` | Recording-Loop, Side-Lock, Live-Skeleton, Knie-Winkel-Overlay |
+| `components/QuantizationControls.tsx` | UI: Quantisierung, Side-Lock, Threading-Toggle, Probanden-ID, JSON-Export |
+| `components/VideoSourcePanel.tsx` | UI: Webcam-vs-Datei + integrierte Aufnahme zu .webm-Download |
+| `services/BiomechanicalAnalyzer.ts` | Zyklus-FSM auf Knie, deskriptive Statistik (Knie-Extension/Flexion) |
+| `services/BenchmarkExporter.ts` | Pro-Frame-Sammlung + Validierungsmetriken + Modell-Fingerprint + Threading-Mode + Video-Quelle |
+| `services/VideoRecorder.ts` | MediaRecorder-Wrapper für Referenz-Video-Aufnahme |
+| `utils/AngleCalculator.ts` | Vektor-Winkel, `calculateKneeAngle`, `isKneeTripleValid`, `SIDE_KEYPOINTS`, `BodySide` |
+| `utils/modelFingerprint.ts` | SHA-256-Hash + Größe + URL des `.tflite`-Files |
+| `types/quantization.ts` | `QuantizationLevel`, lokale Modell-Pfade, `KP`-Indizes, `WARMUP_FRAMES=30` |
 
 ## Zentrale Typen
 ```ts
 QuantizationLevel = 'fp32' | 'fp16' | 'int8'
-Pose = poseDetection.Pose          // { keypoints: Keypoint[17] }
-LastMeasurement { inferenceMs, fps, frameIndex, isWarmup }
+BodySide = 'left' | 'right'
+ThreadingPreference = 'single' | 'multi'
+Pose = { keypoints: Keypoint[17] }
+BiomechanicalAngles = { knee: number | null }
 
 FrameMeasurement {
   frameIndex, timestampMs, inferenceMs, fps,
   kneeAngleRight: number|null, kneeAngleLeft: number|null,
   keypointScores: number[17], isWarmup: boolean
 }
+ModelFingerprint { url, sha256, sizeBytes, loadedAt }
 BenchmarkSession {
   participantId, quantizationLevel, startTimestamp,
-  systemInfo { userAgent, hardwareConcurrency, deviceMemory? },
-  warmupFrames, frames: FrameMeasurement[]
-}
-BenchmarkSummary {
-  totalFrames, validFrames,
-  meanInferenceMs, stdInferenceMs, p50Ms, p95Ms,
-  meanFps, meanKneeAngleRight, meanKneeAngleLeft
+  systemInfo, warmupFrames, lockedSide,
+  modelFingerprint, threadingMode, videoSource, videoSourceName?,
+  frames: FrameMeasurement[],
+  validationMetrics?: { validKneeRatio*, meanKeypointScores, interpolatedFrames, totalCyclesDetected }
 }
 ```
 
-Domänen-Typen unverändert: `BiomechanicalAngles`, `AnalysisResults`, `AngleStatus`, `PedalCycle`, `Recommendation`.
-
 ## Inferenz-Pipeline (`usePoseDetection.detectPose`)
-1. `tf.browser.fromPixels(video)` → `tf.image.resizeBilinear → [192,192,3]`
-2. INT8: `tf.cast(..., 'int32')` (uint8-Input erwartet) — FP32/FP16: float32
-3. `tf.expandDims(..., 0)` → `[1,192,192,3]`
-4. `model.predict(input)` → `await output.data()` (synchronisiert Backend)
-5. Output `[1,1,17,3]` flat parsen: `y,x,score` je Keypoint → in Pixel skalieren
-6. Tensoren disposen (input + output) — Input-Pipeline via `tf.tidy`
+1. `tf.browser.fromPixels(video)` → `[H,W,3]`
+2. `tf.image.resizeBilinear → [192,192,3]`
+3. INT8: `tf.cast(_, 'int32')` (uint8-Input); FP32/FP16: float32
+4. `tf.expandDims(_, 0)` → `[1,192,192,3]`
+5. `model.predict(input)` → `await output.data()` (Backend-Sync)
+6. Output `[1,1,17,3]` flat parsen → 17×{y,x,score} → in Bildkoordinaten skalieren
+7. Tensoren disposen (input + output)
 
-## Optimale Winkelbereiche (`AngleCalculator.ts`)
-- knee gestreckt: 140–150° • knee gebeugt: 65–75° (`KNEE_FLEXION_RANGE`)
-- hip: 40–50° • ankle: 90–110° • elbow: 150–170° • back: 40–50°
-- `evaluateAngle(angle, range, tol=5)` → optimal/acceptable/critical
+## Zyklus-Erkennung
+FSM über geglätteten Kniewinkel:
+```
+searching → extension (knee > 135°)
+extension → flexion  (knee < 115°)
+flexion → extension  (knee > 135°) → Zyklus++
+```
+Hold-Last-Value-Fallback bei kurzen Detection-Aussetzern (max. 5 Frames).
 
-## MoveNet Keypoints
-`0 nose, 5/6 shoulder, 7/8 elbow, 9/10 wrist, 11/12 hip, 13/14 knee, 15/16 ankle` (L/R).
-Konstante `KP` in `types/quantization.ts` exportiert Hip/Knee/Ankle-Indizes.
+## Wissenschaftlicher Mess-Workflow
 
-## Zyklus-Erkennung (Analyzer-FSM)
-- Glättung: Moving Average über `smoothingWindow=5`
-- Schwellen: `kneeThresholdHigh=120°` / `kneeThresholdLow=100°`
-- Min Frames/Zyklus: 10 • Min Confidence: 0.5 • `targetCycles=5`
+```
+1. Aufnahme: Webcam-Modus → "● Aufnahme starten" → "■ Stop & Download" → record.webm
+2. CFR-Konversion: ffmpeg -i record.webm -c:v libx264 -r 30 -vsync cfr -g 1 -pix_fmt yuv420p replay.mp4
+3. Ground Truth: replay.mp4 in 2D-Software (Kinovea o.ä.) → per-Frame Kniewinkel → GT.csv
+4. App: Replay-Datei-Modus + replay.mp4 laden + Quantisierung FP32 → Replay starten → JSON-Export
+5. Threading + Quantisierung wechseln → Replay erneut → Export FP16
+6. dito INT8
+7. Python: paired Frame-Vergleich (frameIndex Join) der drei JSONs gegen GT.csv
+```
 
-## Benchmark-Workflow
-1. App startet → Default `fp32`-Modell wird geladen → Session `P01` automatisch gestartet.
-2. In QuantizationControls Teilnehmer-ID setzen / Stufe wählen (Level-Wechsel ruft `loadModel(level)` + startet neue Session).
-3. 'Analyse starten' → 5 Pedalzyklen werden aufgezeichnet, jeder Frame nach Warmup landet in `benchmarkExporter`.
-4. 'JSON exportieren' → Download `benchmark_${participantId}_${level}_${ISO-Timestamp}.json`.
-5. Python-Postprocessing: `pd.DataFrame(session["frames"])`.
+Quantisierungsstufen-Wechsel triggert automatisch Backend-Reset (`tf.engine().reset()`), damit JIT/Cache-Carryover die Latenz nicht verfälscht.
 
-## Erweiterungs-Hotspots
-- **Neuer Winkel:** Funktion in `AngleCalculator.ts` + `OPTIMAL_RANGES`-Eintrag + Feld in `BiomechanicalAngles` + Erfassung in `AnalysisView` + Statistik in `BiomechanicalAnalyzer.getResults` + Eval-Regel in `RecommendationsEngine`.
-- **Neue Empfehlung:** `analyzeXxx`-Funktion in `RecommendationsEngine.ts`, in `generateRecommendations` aufrufen.
-- **Modell-URLs ändern:** `TFLITE_MODEL_URLS` in `types/quantization.ts` (z.B. lokaler Mirror falls TFHub blockiert).
-- **Anderes Modell / Backend:** `usePoseDetection.ts` → `loadTFLiteModel`-Aufruf bzw. `tf.setBackend('wasm'|'webgl'|...)`. Output-Parsing in `detectPose` ggf. anpassen (`[1,1,17,3]`-Annahme).
-- **Andere Persistenz:** `HistoryStorage.ts` (Analyse) bzw. `BenchmarkExporter.ts` (Benchmarks) — beide LocalStorage-/Download-only.
-- **Schwellen/Targets tunen:** `DEFAULT_CONFIG` in `BiomechanicalAnalyzer.ts`, `WARMUP_FRAMES` in `types/quantization.ts`.
-- **Zusätzliche Benchmark-Metriken:** `FrameMeasurement` erweitern + `recordFrame`-Aufruf in `App.handleFrameMeasurement` ergänzen.
+## Modell-Pfade
+- `public/models/movenet-lightning-fp32.tflite` (~9.3 MB)
+- `public/models/movenet-lightning-fp16.tflite` (~4.7 MB)
+- `public/models/movenet-lightning-int8.tflite` (~2.8 MB)
+
+Download von [Kaggle MoveNet TFLite](https://www.kaggle.com/models/google/movenet/tfLite/singlepose-lightning) — siehe `public/models/README.md`.
+
+## WASM-Threading-Hinweis
+Multi-Threading benötigt `SharedArrayBuffer`, das nur mit COOP/COEP-Headern verfügbar ist:
+```
+Cross-Origin-Opener-Policy: same-origin
+Cross-Origin-Embedder-Policy: require-corp
+```
+Diese sind aktuell nicht gesetzt → effektiver Modus ist **single-thread**. Die UI zeigt den aktiven Modus an und loggt ihn im JSON-Export. Für Multi-Thread-Vergleich: Vite-Plugin oder Reverse-Proxy konfigurieren + WASM-Binaries lokal hosten.
 
 ## Konventionen / Gotchas
 - UI/Kommentare auf Deutsch.
-- Keine Tests, kein Backend, keine ENV-Vars.
-- Singleton-Pattern für Analyzer (`getAnalyzer`/`resetAnalyzer`) und Exporter (`benchmarkExporter`).
-- Canvas-Y zeigt nach unten (relevant für `calculateBackAngle`).
-- `rawCycles` werden bewusst NICHT in History serialisiert (zu groß).
-- TFLite Backend (`wasm`) muss vor `loadTFLiteModel` initialisiert sein (`setBackend('wasm')` + `tf.ready()` — passiert einmalig im Hook via `backendReadyRef`).
-- `lastMeasurementRef` ist ein React-Ref, das `detectPose` synchron befüllt — App.tsx kann nach `await detectPose(...)` ohne setState-Race darauf zugreifen.
-- INT8-Modell erwartet uint8-Input → in der Pipeline wird das `resizeBilinear`-Float-Resultat per `tf.cast(_, 'int32')` zurück gewandelt.
-- `--legacy-peer-deps` erforderlich beim Installieren neuer Dependencies.
+- `--legacy-peer-deps` (via `.npmrc`) wegen tfjs-tflite alpha-9 peer.
+- Singleton-Pattern für `benchmarkExporter`.
+- File-Replay erwartet **CFR-Video** — VFR-Aufnahmen erst ffmpeg-konvertieren.
+- Mess-Sessions: ein Quantisierungs-Wechsel pro Session, dazwischen `resetBackend` (passiert automatisch im UI-Flow).
+- Modell-Fingerprint pro Session geloggt → Re-Run-Reproduzierbarkeit verifizierbar.
