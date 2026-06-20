@@ -1,13 +1,13 @@
-import { useState, useCallback, useEffect } from 'react';
-import { usePoseDetection, type Pose } from './hooks/usePoseDetection';
-import { AnalysisView } from './components/AnalysisView';
-import { QuantizationControls } from './components/QuantizationControls';
-import { VideoSourcePanel } from './components/VideoSourcePanel';
-import { AnalysisResults } from './services/BiomechanicalAnalyzer';
-import { benchmarkExporter } from './services/BenchmarkExporter';
-import { calculateKneeAngle, type BodySide } from './utils/AngleCalculator';
-import { KP, type QuantizationLevel } from './types/quantization';
-import type { VideoSourceMode } from './hooks/useVideoSource';
+import { useState, useCallback, useEffect } from "react";
+import { usePoseDetection, type Pose } from "./hooks/usePoseDetection";
+import { AnalysisView } from "./components/AnalysisView";
+import { QuantizationControls } from "./components/QuantizationControls";
+import { VideoSourcePanel } from "./components/VideoSourcePanel";
+import { AnalysisResults } from "./services/BiomechanicalAnalyzer";
+import { benchmarkExporter } from "./services/BenchmarkExporter";
+import { calculateKneeAngle, type BodySide } from "./utils/AngleCalculator";
+import { KP, type QuantizationLevel } from "./types/quantization";
+import type { VideoSourceMode } from "./hooks/useVideoSource";
 
 function App() {
   const {
@@ -18,6 +18,7 @@ function App() {
     detector,
     loadModel,
     resetBackend,
+    beginWarmup,
     currentLevel,
     isWarmingUp,
     lastMeasurementRef,
@@ -26,12 +27,13 @@ function App() {
     setThreadingPreference,
     multiThreadingAvailable,
     activeThreadingMode,
-  } = usePoseDetection('fp32');
+    activeNumThreads,
+  } = usePoseDetection("fp32");
 
-  const [participantId, setParticipantId] = useState('P01');
-  const [videoMode, setVideoMode] = useState<VideoSourceMode>('webcam');
+  const [participantId, setParticipantId] = useState("P01");
+  const [videoMode, setVideoMode] = useState<VideoSourceMode>("webcam");
   const [videoFile, setVideoFile] = useState<File | null>(null);
-  const [forcedSide, setForcedSide] = useState<BodySide>('right');
+  const [forcedSide, setForcedSide] = useState<BodySide>("right");
   const [analysisResults, setAnalysisResults] =
     useState<AnalysisResults | null>(null);
   const [lastSummary, setLastSummary] = useState<{
@@ -47,6 +49,7 @@ function App() {
     benchmarkExporter.setLockedSide(forcedSide);
     benchmarkExporter.setModelFingerprint(modelFingerprint);
     benchmarkExporter.setThreadingMode(activeThreadingMode);
+    benchmarkExporter.setNumThreads(activeNumThreads);
     benchmarkExporter.setVideoSource(videoMode, videoFile?.name);
   }, [
     detector,
@@ -55,6 +58,7 @@ function App() {
     forcedSide,
     modelFingerprint,
     activeThreadingMode,
+    activeNumThreads,
     videoMode,
     videoFile,
   ]);
@@ -65,11 +69,11 @@ function App() {
       await resetBackend();
       await loadModel(level);
     },
-    [currentLevel, resetBackend, loadModel]
+    [currentLevel, resetBackend, loadModel],
   );
 
   const handleThreadingChange = useCallback(
-    async (mode: 'single' | 'multi') => {
+    async (mode: "single" | "multi") => {
       if (mode === threadingPreference) return;
       setThreadingPreference(mode);
       // Backend muss vollständig neu für anderen Threading-Modus
@@ -82,7 +86,7 @@ function App() {
       resetBackend,
       loadModel,
       currentLevel,
-    ]
+    ],
   );
 
   const handleExport = useCallback(() => {
@@ -98,7 +102,7 @@ function App() {
       benchmarkExporter.finalizeMetrics(interpolated, cycles);
       setLastSummary({ interpolated, cycles });
     },
-    []
+    [],
   );
 
   const handleFrameMeasurement = useCallback(
@@ -109,12 +113,12 @@ function App() {
       const kneeRight = calculateKneeAngle(
         kp[KP.RIGHT_HIP],
         kp[KP.RIGHT_KNEE],
-        kp[KP.RIGHT_ANKLE]
+        kp[KP.RIGHT_ANKLE],
       );
       const kneeLeft = calculateKneeAngle(
         kp[KP.LEFT_HIP],
         kp[KP.LEFT_KNEE],
-        kp[KP.LEFT_ANKLE]
+        kp[KP.LEFT_ANKLE],
       );
       benchmarkExporter.recordFrame({
         frameIndex: m.frameIndex,
@@ -127,12 +131,12 @@ function App() {
         isWarmup: m.isWarmup,
       });
     },
-    [lastMeasurementRef]
+    [lastMeasurementRef],
   );
 
   const handleAnalysisComplete = useCallback(
     (results: AnalysisResults) => setAnalysisResults(results),
-    []
+    [],
   );
 
   const handleResetSession = useCallback(() => {
@@ -143,6 +147,7 @@ function App() {
     benchmarkExporter.setLockedSide(forcedSide);
     benchmarkExporter.setModelFingerprint(modelFingerprint);
     benchmarkExporter.setThreadingMode(activeThreadingMode);
+    benchmarkExporter.setNumThreads(activeNumThreads);
     benchmarkExporter.setVideoSource(videoMode, videoFile?.name);
   }, [
     participantId,
@@ -150,6 +155,7 @@ function App() {
     forcedSide,
     modelFingerprint,
     activeThreadingMode,
+    activeNumThreads,
     videoMode,
     videoFile,
   ]);
@@ -172,17 +178,17 @@ function App() {
                 className={`w-3 h-3 rounded-full ${
                   detector
                     ? isWarmingUp
-                      ? 'bg-yellow-400 animate-pulse'
-                      : 'bg-green-400 animate-pulse'
-                    : 'bg-yellow-400'
+                      ? "bg-yellow-400 animate-pulse"
+                      : "bg-green-400 animate-pulse"
+                    : "bg-yellow-400"
                 }`}
               />
               <span className="text-sm text-gray-400 font-mono">
                 {!detector
-                  ? 'Lädt...'
+                  ? "Lädt..."
                   : isWarmingUp
-                  ? `Warmup (${currentLevel})`
-                  : `Bereit (${currentLevel}/${activeThreadingMode})`}
+                    ? `Warmup (${currentLevel})`
+                    : `Bereit (${currentLevel}/${activeThreadingMode})`}
               </span>
             </div>
           </div>
@@ -206,6 +212,7 @@ function App() {
             onFrameMeasurement={handleFrameMeasurement}
             onSideLocked={handleSideLocked}
             onRecordingFinalize={handleRecordingFinalize}
+            onRecordingStart={beginWarmup}
             videoMode={videoMode}
             videoFile={videoFile}
             forcedSide={forcedSide}
@@ -294,7 +301,7 @@ function App() {
                   <span>Knie max ⌀</span>
                   <span className="font-mono">
                     {analysisResults.statistics.kneeExtension.average.toFixed(
-                      1
+                      1,
                     )}
                     °
                   </span>
@@ -302,10 +309,7 @@ function App() {
                 <div className="flex justify-between text-gray-400">
                   <span>Knie min ⌀</span>
                   <span className="font-mono">
-                    {analysisResults.statistics.kneeFlexion.average.toFixed(
-                      1
-                    )}
-                    °
+                    {analysisResults.statistics.kneeFlexion.average.toFixed(1)}°
                   </span>
                 </div>
                 {lastSummary && (
