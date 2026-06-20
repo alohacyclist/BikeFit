@@ -1,30 +1,25 @@
 /**
- * BiomechanicalAnalyzer - Zyklus-Erkennung und Datenanalyse für Bike-Fitting
+ * BiomechanicalAnalyzer — Pedalzyklus-Erkennung über den Kniewinkel.
  *
- * Erkennt Pedalzyklen über Kniewinkel-Variationen und sammelt
- * biomechanische Daten für die Analyse.
+ * Scope: Kniewinkel-only. Die FSM erkennt Pedalzyklen aus geglätteten
+ * Kniewinkel-Verläufen; Statistiken werden ausschließlich für das Knie
+ * berechnet.
  */
 
 import {
   BiomechanicalAngles,
-  OPTIMAL_RANGES,
+  KNEE_EXTENSION_RANGE,
   KNEE_FLEXION_RANGE,
   evaluateAngle,
-  AngleStatus
+  AngleStatus,
 } from '../utils/AngleCalculator';
 
-/**
- * Ein einzelner Frame mit allen Winkeldaten
- */
 export interface FrameData {
   timestamp: number;
   angles: BiomechanicalAngles;
   confidence: number;
 }
 
-/**
- * Ein vollständiger Pedalzyklus
- */
 export interface PedalCycle {
   startTime: number;
   endTime: number;
@@ -33,9 +28,6 @@ export interface PedalCycle {
   frames: FrameData[];
 }
 
-/**
- * Statistiken für einen Winkel über mehrere Zyklen
- */
 export interface AngleStatistics {
   min: number;
   max: number;
@@ -44,60 +36,43 @@ export interface AngleStatistics {
   samples: number;
 }
 
-/**
- * Komplette Analyse-Ergebnisse
- */
 export interface AnalysisResults {
   cycleCount: number;
   duration: number;
   timestamp: Date;
   statistics: {
-    knee: {
-      extension: AngleStatistics; // Max-Winkel (gestrecktes Bein)
-      flexion: AngleStatistics;   // Min-Winkel (gebeugtes Bein)
-    };
-    hip: AngleStatistics;
-    ankle: AngleStatistics;
-    elbow: AngleStatistics;
-    back: AngleStatistics;
+    kneeExtension: AngleStatistics;
+    kneeFlexion: AngleStatistics;
   };
   evaluations: {
     kneeExtension: AngleStatus;
     kneeFlexion: AngleStatus;
-    hip: AngleStatus;
-    ankle: AngleStatus;
-    elbow: AngleStatus;
-    back: AngleStatus;
   };
   rawCycles: PedalCycle[];
 }
 
-/**
- * Konfiguration für den Analyzer
- */
 export interface AnalyzerConfig {
-  targetCycles: number;          // Anzahl gewünschter Zyklen (Standard: 5)
-  minCycleFrames: number;        // Minimale Frames pro Zyklus
-  minConfidence: number;         // Minimale Keypoint-Confidence
-  kneeThresholdHigh: number;     // Schwelle für gestrecktes Bein (°)
-  kneeThresholdLow: number;      // Schwelle für gebeugtes Bein (°)
-  smoothingWindow: number;       // Frames für Glättung
+  targetCycles: number;
+  minCycleFrames: number;
+  minConfidence: number;
+  kneeThresholdHigh: number;
+  kneeThresholdLow: number;
+  smoothingWindow: number;
 }
 
 const DEFAULT_CONFIG: AnalyzerConfig = {
   targetCycles: 5,
   minCycleFrames: 10,
-  minConfidence: 0.5,
-  kneeThresholdHigh: 120,
-  kneeThresholdLow: 100,
-  smoothingWindow: 5
+  minConfidence: 0.3,
+  kneeThresholdHigh: 135,
+  kneeThresholdLow: 115,
+  smoothingWindow: 5,
 };
 
-type CyclePhase = 'searching' | 'flexion' | 'extension';
+const MAX_INTERPOLATED_FRAMES = 5;
 
-/**
- * BiomechanicalAnalyzer Klasse
- */
+export type CyclePhase = 'searching' | 'flexion' | 'extension';
+
 export class BiomechanicalAnalyzer {
   private config: AnalyzerConfig;
   private frames: FrameData[] = [];
@@ -105,60 +80,65 @@ export class BiomechanicalAnalyzer {
   private currentPhase: CyclePhase = 'searching';
   private cycleStartIndex: number = 0;
   private smoothedKneeAngles: number[] = [];
+  private lastValidKneeAngle: number | null = null;
+  private interpolatedFrameCount: number = 0;
+  private interpolatedFramesTotal: number = 0;
 
   constructor(config: Partial<AnalyzerConfig> = {}) {
     this.config = { ...DEFAULT_CONFIG, ...config };
   }
 
-  /**
-   * Fügt einen neuen Frame zur Analyse hinzu
-   */
   addFrame(angles: BiomechanicalAngles, confidence: number): void {
     const frame: FrameData = {
       timestamp: performance.now(),
       angles,
-      confidence
+      confidence,
     };
-
     this.frames.push(frame);
 
-    // Zyklus-Erkennung nur wenn Kniewinkel verfügbar
+    let kneeForDetect: number | null = null;
     if (angles.knee !== null && confidence >= this.config.minConfidence) {
-      this.detectCycle(angles.knee);
+      kneeForDetect = angles.knee;
+      this.lastValidKneeAngle = angles.knee;
+      this.interpolatedFrameCount = 0;
+    } else if (
+      this.lastValidKneeAngle !== null &&
+      this.interpolatedFrameCount < MAX_INTERPOLATED_FRAMES
+    ) {
+      kneeForDetect = this.lastValidKneeAngle;
+      this.interpolatedFrameCount += 1;
+      this.interpolatedFramesTotal += 1;
     }
+    if (kneeForDetect !== null) this.detectCycle(kneeForDetect);
   }
 
-  /**
-   * Erkennt Pedalzyklen basierend auf Kniewinkel-Variation
-   */
+  getInterpolatedFramesCount(): number {
+    return this.interpolatedFramesTotal;
+  }
+
   private detectCycle(kneeAngle: number): void {
-    // Glättung anwenden
     this.smoothedKneeAngles.push(kneeAngle);
     if (this.smoothedKneeAngles.length > this.config.smoothingWindow) {
       this.smoothedKneeAngles.shift();
     }
-
-    const smoothedAngle = this.getSmoothedValue(this.smoothedKneeAngles);
+    const smoothed =
+      this.smoothedKneeAngles.reduce((a, b) => a + b, 0) /
+      this.smoothedKneeAngles.length;
 
     switch (this.currentPhase) {
       case 'searching':
-        // Warte auf gestrecktes Bein (hoher Winkel)
-        if (smoothedAngle > this.config.kneeThresholdHigh) {
+        if (smoothed > this.config.kneeThresholdHigh) {
           this.currentPhase = 'extension';
           this.cycleStartIndex = this.frames.length - 1;
         }
         break;
-
       case 'extension':
-        // Bein war gestreckt, warte auf Beugung
-        if (smoothedAngle < this.config.kneeThresholdLow) {
+        if (smoothed < this.config.kneeThresholdLow) {
           this.currentPhase = 'flexion';
         }
         break;
-
       case 'flexion':
-        // Bein war gebeugt, warte auf erneute Streckung = Zyklus komplett
-        if (smoothedAngle > this.config.kneeThresholdHigh) {
+        if (smoothed > this.config.kneeThresholdHigh) {
           this.completeCycle();
           this.cycleStartIndex = this.frames.length - 1;
           this.currentPhase = 'extension';
@@ -167,198 +147,95 @@ export class BiomechanicalAnalyzer {
     }
   }
 
-  /**
-   * Schließt einen Zyklus ab
-   */
   private completeCycle(): void {
     const cycleFrames = this.frames.slice(this.cycleStartIndex);
-
-    if (cycleFrames.length < this.config.minCycleFrames) {
-      return; // Zu kurzer Zyklus, ignorieren
-    }
-
+    if (cycleFrames.length < this.config.minCycleFrames) return;
     const kneeAngles = cycleFrames
-      .map(f => f.angles.knee)
+      .map((f) => f.angles.knee)
       .filter((a): a is number => a !== null);
-
     if (kneeAngles.length === 0) return;
-
-    const cycle: PedalCycle = {
+    this.cycles.push({
       startTime: cycleFrames[0].timestamp,
       endTime: cycleFrames[cycleFrames.length - 1].timestamp,
       kneeMin: Math.min(...kneeAngles),
       kneeMax: Math.max(...kneeAngles),
-      frames: cycleFrames
-    };
-
-    this.cycles.push(cycle);
+      frames: cycleFrames,
+    });
   }
 
-  /**
-   * Berechnet geglätteten Wert
-   */
-  private getSmoothedValue(values: number[]): number {
-    if (values.length === 0) return 0;
-    return values.reduce((a, b) => a + b, 0) / values.length;
-  }
-
-  /**
-   * Gibt die Anzahl erkannter Zyklen zurück
-   */
   getCycleCount(): number {
     return this.cycles.length;
   }
-
-  /**
-   * Gibt den aktuellen Fortschritt zurück (0-1)
-   */
   getProgress(): number {
     return Math.min(1, this.cycles.length / this.config.targetCycles);
   }
-
-  /**
-   * Prüft ob genug Zyklen erfasst wurden
-   */
   isComplete(): boolean {
     return this.cycles.length >= this.config.targetCycles;
   }
-
-  /**
-   * Gibt die aktuelle Phase zurück
-   */
   getCurrentPhase(): CyclePhase {
     return this.currentPhase;
   }
 
-  /**
-   * Berechnet Statistiken für ein Array von Werten
-   */
   private calculateStatistics(values: number[]): AngleStatistics {
-    if (values.length === 0) {
+    if (values.length === 0)
       return { min: 0, max: 0, average: 0, stdDev: 0, samples: 0 };
-    }
-
     const min = Math.min(...values);
     const max = Math.max(...values);
     const average = values.reduce((a, b) => a + b, 0) / values.length;
-
-    const squaredDiffs = values.map(v => Math.pow(v - average, 2));
-    const avgSquaredDiff = squaredDiffs.reduce((a, b) => a + b, 0) / values.length;
-    const stdDev = Math.sqrt(avgSquaredDiff);
-
-    return { min, max, average, stdDev, samples: values.length };
-  }
-
-  /**
-   * Extrahiert alle gültigen Werte eines Winkels aus allen Zyklen
-   */
-  private extractAngleValues(
-    angleKey: keyof BiomechanicalAngles
-  ): number[] {
-    const values: number[] = [];
-
-    for (const cycle of this.cycles) {
-      for (const frame of cycle.frames) {
-        const angle = frame.angles[angleKey];
-        if (angle !== null && frame.confidence >= this.config.minConfidence) {
-          values.push(angle);
-        }
-      }
-    }
-
-    return values;
-  }
-
-  /**
-   * Generiert die vollständigen Analyse-Ergebnisse
-   */
-  getResults(): AnalysisResults | null {
-    if (this.cycles.length === 0) {
-      return null;
-    }
-
-    // Knie-Statistiken (Min/Max pro Zyklus)
-    const kneeMaxValues = this.cycles.map(c => c.kneeMax);
-    const kneeMinValues = this.cycles.map(c => c.kneeMin);
-
-    // Andere Winkel-Statistiken
-    const hipValues = this.extractAngleValues('hip');
-    const ankleValues = this.extractAngleValues('ankle');
-    const elbowValues = this.extractAngleValues('elbow');
-    const backValues = this.extractAngleValues('back');
-
-    const kneeExtensionStats = this.calculateStatistics(kneeMaxValues);
-    const kneeFlexionStats = this.calculateStatistics(kneeMinValues);
-
-    // Bewertungen berechnen
-    const evaluations = {
-      kneeExtension: evaluateAngle(kneeExtensionStats.average, OPTIMAL_RANGES.knee),
-      kneeFlexion: evaluateAngle(kneeFlexionStats.average, KNEE_FLEXION_RANGE),
-      hip: evaluateAngle(
-        this.calculateStatistics(hipValues).average,
-        OPTIMAL_RANGES.hip
-      ),
-      ankle: evaluateAngle(
-        this.calculateStatistics(ankleValues).average,
-        OPTIMAL_RANGES.ankle
-      ),
-      elbow: evaluateAngle(
-        this.calculateStatistics(elbowValues).average,
-        OPTIMAL_RANGES.elbow
-      ),
-      back: evaluateAngle(
-        this.calculateStatistics(backValues).average,
-        OPTIMAL_RANGES.back
-      )
+    const squaredDiffs = values.map((v) => Math.pow(v - average, 2));
+    const variance =
+      squaredDiffs.reduce((a, b) => a + b, 0) / values.length;
+    return {
+      min,
+      max,
+      average,
+      stdDev: Math.sqrt(variance),
+      samples: values.length,
     };
+  }
 
-    const firstCycle = this.cycles[0];
-    const lastCycle = this.cycles[this.cycles.length - 1];
-
+  getResults(): AnalysisResults | null {
+    if (this.cycles.length === 0) return null;
+    const kneeMaxValues = this.cycles.map((c) => c.kneeMax);
+    const kneeMinValues = this.cycles.map((c) => c.kneeMin);
+    const kneeExt = this.calculateStatistics(kneeMaxValues);
+    const kneeFlex = this.calculateStatistics(kneeMinValues);
+    const first = this.cycles[0];
+    const last = this.cycles[this.cycles.length - 1];
     return {
       cycleCount: this.cycles.length,
-      duration: lastCycle.endTime - firstCycle.startTime,
+      duration: last.endTime - first.startTime,
       timestamp: new Date(),
-      statistics: {
-        knee: {
-          extension: kneeExtensionStats,
-          flexion: kneeFlexionStats
-        },
-        hip: this.calculateStatistics(hipValues),
-        ankle: this.calculateStatistics(ankleValues),
-        elbow: this.calculateStatistics(elbowValues),
-        back: this.calculateStatistics(backValues)
+      statistics: { kneeExtension: kneeExt, kneeFlexion: kneeFlex },
+      evaluations: {
+        kneeExtension: evaluateAngle(kneeExt.average, KNEE_EXTENSION_RANGE),
+        kneeFlexion: evaluateAngle(kneeFlex.average, KNEE_FLEXION_RANGE),
       },
-      evaluations,
-      rawCycles: this.cycles
+      rawCycles: this.cycles,
     };
   }
 
-  /**
-   * Setzt den Analyzer zurück
-   */
   reset(): void {
     this.frames = [];
     this.cycles = [];
     this.currentPhase = 'searching';
     this.cycleStartIndex = 0;
     this.smoothedKneeAngles = [];
+    this.lastValidKneeAngle = null;
+    this.interpolatedFrameCount = 0;
+    this.interpolatedFramesTotal = 0;
   }
 
-  /**
-   * Aktualisiert die Konfiguration
-   */
   updateConfig(config: Partial<AnalyzerConfig>): void {
     this.config = { ...this.config, ...config };
   }
 }
 
-/**
- * Singleton-Instanz für globalen Zugriff
- */
 let analyzerInstance: BiomechanicalAnalyzer | null = null;
 
-export function getAnalyzer(config?: Partial<AnalyzerConfig>): BiomechanicalAnalyzer {
+export function getAnalyzer(
+  config?: Partial<AnalyzerConfig>
+): BiomechanicalAnalyzer {
   if (!analyzerInstance) {
     analyzerInstance = new BiomechanicalAnalyzer(config);
   }
@@ -366,8 +243,6 @@ export function getAnalyzer(config?: Partial<AnalyzerConfig>): BiomechanicalAnal
 }
 
 export function resetAnalyzer(): void {
-  if (analyzerInstance) {
-    analyzerInstance.reset();
-  }
+  if (analyzerInstance) analyzerInstance.reset();
   analyzerInstance = null;
 }

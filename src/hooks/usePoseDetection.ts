@@ -44,6 +44,10 @@ import {
   MODEL_INPUT_SIZE,
   KEYPOINT_NAMES,
 } from "../types/quantization";
+import {
+  fingerprintModel,
+  type ModelFingerprint,
+} from "../utils/modelFingerprint";
 
 export interface PoseMetrics {
   inferenceTime: number;
@@ -61,6 +65,8 @@ export interface LastMeasurement {
   isWarmup: boolean;
 }
 
+export type ThreadingPreference = "single" | "multi";
+
 export interface UsePoseDetectionResult {
   detector: TFLiteModelLike | null;
   poses: Pose[];
@@ -69,9 +75,19 @@ export interface UsePoseDetectionResult {
   error: string | null;
   detectPose: (video: HTMLVideoElement) => Promise<Pose | null>;
   loadModel: (level: QuantizationLevel) => Promise<void>;
+  resetBackend: () => Promise<void>;
   currentLevel: QuantizationLevel;
   isWarmingUp: boolean;
   lastMeasurementRef: React.MutableRefObject<LastMeasurement | null>;
+  /** Fingerprint des aktuell geladenen Modells (null vor erstem Load). */
+  modelFingerprint: ModelFingerprint | null;
+  /** Vom Nutzer gewählter Threading-Modus. */
+  threadingPreference: ThreadingPreference;
+  setThreadingPreference: (mode: ThreadingPreference) => void;
+  /** Tatsächlich verfügbarer Threading-Status (SharedArrayBuffer + COOP/COEP). */
+  multiThreadingAvailable: boolean;
+  /** Effektiver Modus nach Backend-Init. */
+  activeThreadingMode: "single" | "multi" | "unknown";
 }
 
 /**
@@ -88,6 +104,15 @@ export function usePoseDetection(
   const [currentLevel, setCurrentLevel] =
     useState<QuantizationLevel>(initialLevel);
   const [isWarmingUp, setIsWarmingUp] = useState(true);
+  const [modelFingerprint, setModelFingerprint] =
+    useState<ModelFingerprint | null>(null);
+  // SharedArrayBuffer existiert nur mit COOP/COEP-Headern.
+  const multiThreadingAvailable = typeof SharedArrayBuffer !== "undefined";
+  const [threadingPreference, setThreadingPreference] =
+    useState<ThreadingPreference>(multiThreadingAvailable ? "multi" : "single");
+  const [activeThreadingMode, setActiveThreadingMode] = useState<
+    "single" | "multi" | "unknown"
+  >("unknown");
   const [metrics, setMetrics] = useState<PoseMetrics>({
     inferenceTime: 0,
     fps: 0,
@@ -102,6 +127,24 @@ export function usePoseDetection(
   const levelRef = useRef<QuantizationLevel>(initialLevel);
   const lastMeasurementRef = useRef<LastMeasurement | null>(null);
 
+  /**
+   * Vollständiger Backend-Reset: verwirft Variablen, leert Engine-State.
+   * Aufrufen zwischen Quantisierungsstufen, damit Cache-/JIT-Carryover
+   * die Latenz-Messung nicht verzerrt.
+   * Nutzt die nächste loadModel()-Inferenz für Re-Initialisierung.
+   */
+  const resetBackend = useCallback(async () => {
+    try {
+      tf.disposeVariables();
+      tf.engine().reset();
+      // Re-Init beim nächsten loadModel erzwingen
+      backendReadyRef.current = false;
+      setDetector(null);
+    } catch (e) {
+      console.error("Backend-Reset fehlgeschlagen:", e);
+    }
+  }, []);
+
   // Modell laden (auch bei Level-Wechsel aufrufbar)
   const loadModel = useCallback(async (level: QuantizationLevel) => {
     try {
@@ -114,12 +157,26 @@ export function usePoseDetection(
 
       // Backend nur einmal initialisieren
       if (!backendReadyRef.current) {
+        // Threading-Präferenz VOR setBackend setzen — sonst greift sie nicht.
+        // SharedArrayBuffer braucht COOP/COEP-Header; sonst Fallback single.
+        const wantMulti =
+          threadingPreference === "multi" && multiThreadingAvailable;
+        tf.env().set("WASM_HAS_MULTITHREAD_SUPPORT", wantMulti);
+        tf.env().set("WASM_HAS_SIMD_SUPPORT", true);
+
         // WASM-Binaries vom jsDelivr-CDN laden (Vite serviert sie sonst nicht)
         setWasmPaths(
           "https://cdn.jsdelivr.net/npm/@tensorflow/tfjs-backend-wasm@4.22.0/dist/",
         );
         await tf.setBackend("wasm");
         await tf.ready();
+
+        const effective = (tf
+          .env()
+          .get("WASM_HAS_MULTITHREAD_SUPPORT") as boolean)
+          ? "multi"
+          : "single";
+        setActiveThreadingMode(effective);
 
         // window.tf MUSS gesetzt sein, BEVOR das tfjs-tflite UMD lädt
         // — die UMD-Factory captured tf bei der ersten Auswertung.
@@ -129,7 +186,12 @@ export function usePoseDetection(
         await loadTFLiteScript();
 
         backendReadyRef.current = true;
-        console.log("TensorFlow.js Backend:", tf.getBackend());
+        console.log(
+          "TensorFlow.js Backend:",
+          tf.getBackend(),
+          "Threading:",
+          effective,
+        );
       }
 
       // Altes Modell verwerfen
@@ -159,12 +221,18 @@ export function usePoseDetection(
           "https://cdn.jsdelivr.net/npm/@tensorflow/tfjs-tflite@0.0.1-alpha.9/dist/",
         );
       }
-      const model = await window.tflite.loadTFLiteModel(
-        TFLITE_MODEL_URLS[level],
-      );
+      // Modell-Fingerprint parallel berechnen (zweiter fetch trifft Browser-Cache)
+      const [model, fingerprint] = await Promise.all([
+        window.tflite.loadTFLiteModel(TFLITE_MODEL_URLS[level]),
+        fingerprintModel(TFLITE_MODEL_URLS[level]).catch((e) => {
+          console.warn("Fingerprint fehlgeschlagen:", e);
+          return null;
+        }),
+      ]);
 
       levelRef.current = level;
       setCurrentLevel(level);
+      setModelFingerprint(fingerprint);
       setDetector(model);
       setIsLoading(false);
       console.log(`TFLite-Modell geladen (${level})`);
@@ -318,8 +386,14 @@ export function usePoseDetection(
     error,
     detectPose,
     loadModel,
+    resetBackend,
     currentLevel,
     isWarmingUp,
     lastMeasurementRef,
+    modelFingerprint,
+    threadingPreference,
+    setThreadingPreference,
+    multiThreadingAvailable,
+    activeThreadingMode,
   };
 }

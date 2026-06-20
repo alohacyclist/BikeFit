@@ -1,120 +1,110 @@
-import { useState, useCallback, useEffect, useRef } from 'react';
+import { useState, useCallback, useEffect } from 'react';
 import { usePoseDetection, type Pose } from './hooks/usePoseDetection';
-import { VideoCanvas } from './components/VideoCanvas';
-import { MetricsOverlay } from './components/MetricsOverlay';
 import { AnalysisView } from './components/AnalysisView';
-import { ResultsDashboard } from './components/ResultsDashboard';
-import { HistoryView } from './components/HistoryView';
 import { QuantizationControls } from './components/QuantizationControls';
+import { VideoSourcePanel } from './components/VideoSourcePanel';
 import { AnalysisResults } from './services/BiomechanicalAnalyzer';
-import { generateRecommendations } from './services/RecommendationsEngine';
-import { saveToHistory, HistoryEntry } from './services/HistoryStorage';
 import { benchmarkExporter } from './services/BenchmarkExporter';
-import { calculateKneeAngle } from './utils/AngleCalculator';
+import { calculateKneeAngle, type BodySide } from './utils/AngleCalculator';
 import { KP, type QuantizationLevel } from './types/quantization';
-
-type AppView = 'home' | 'analysis' | 'results' | 'history';
+import type { VideoSourceMode } from './hooks/useVideoSource';
 
 function App() {
   const {
-    poses,
     metrics,
     isLoading,
     error,
     detectPose,
     detector,
     loadModel,
+    resetBackend,
     currentLevel,
     isWarmingUp,
     lastMeasurementRef,
+    modelFingerprint,
+    threadingPreference,
+    setThreadingPreference,
+    multiThreadingAvailable,
+    activeThreadingMode,
   } = usePoseDetection('fp32');
 
-  const [kneeAngle, setKneeAngle] = useState<number | null>(null);
-  const [hipAngle, setHipAngle] = useState<number | null>(null);
-  const [currentView, setCurrentView] = useState<AppView>('home');
+  const [participantId, setParticipantId] = useState('P01');
+  const [videoMode, setVideoMode] = useState<VideoSourceMode>('webcam');
+  const [videoFile, setVideoFile] = useState<File | null>(null);
+  const [forcedSide, setForcedSide] = useState<BodySide>('right');
   const [analysisResults, setAnalysisResults] =
     useState<AnalysisResults | null>(null);
+  const [lastSummary, setLastSummary] = useState<{
+    interpolated: number;
+    cycles: number;
+  } | null>(null);
 
-  // Benchmark-State
-  const [participantId, setParticipantId] = useState('P01');
-  const sessionStartedRef = useRef(false);
-
-  // Session beim ersten Detector-Ready starten
+  // Session bei Detektor-Ready / Level- / Side-Wechsel neu starten
   useEffect(() => {
-    if (detector && !sessionStartedRef.current) {
-      benchmarkExporter.startSession(participantId, currentLevel);
-      sessionStartedRef.current = true;
-    }
-  }, [detector, participantId, currentLevel]);
+    if (!detector) return;
+    benchmarkExporter.reset();
+    benchmarkExporter.startSession(participantId, currentLevel);
+    benchmarkExporter.setLockedSide(forcedSide);
+    benchmarkExporter.setModelFingerprint(modelFingerprint);
+    benchmarkExporter.setThreadingMode(activeThreadingMode);
+    benchmarkExporter.setVideoSource(videoMode, videoFile?.name);
+  }, [
+    detector,
+    currentLevel,
+    participantId,
+    forcedSide,
+    modelFingerprint,
+    activeThreadingMode,
+    videoMode,
+    videoFile,
+  ]);
 
-  const handleAnglesUpdate = useCallback(
-    (knee: number | null, hip: number | null) => {
-      setKneeAngle(knee);
-      setHipAngle(hip);
-    },
-    []
-  );
-
-  const handleAnalysisComplete = useCallback((results: AnalysisResults) => {
-    setAnalysisResults(results);
-    const recommendations = generateRecommendations(results);
-    saveToHistory(results, recommendations);
-    setCurrentView('results');
-  }, []);
-
-  const handleSelectHistoryEntry = useCallback((entry: HistoryEntry) => {
-    setAnalysisResults(entry.results);
-    setCurrentView('results');
-  }, []);
-
-  const handleStartAnalysis = () => {
-    setCurrentView('analysis');
-    setAnalysisResults(null);
-  };
-
-  const handleNewAnalysis = () => {
-    setAnalysisResults(null);
-    setCurrentView('analysis');
-  };
-
-  const handleBackToHome = () => {
-    setCurrentView('home');
-    setAnalysisResults(null);
-  };
-
-  // Quantisierungsstufe wechseln — neue Benchmark-Session beginnen
   const handleLevelChange = useCallback(
     async (level: QuantizationLevel) => {
       if (level === currentLevel) return;
-      benchmarkExporter.reset();
-      benchmarkExporter.startSession(participantId, level);
-      sessionStartedRef.current = true;
+      await resetBackend();
       await loadModel(level);
     },
-    [currentLevel, participantId, loadModel]
+    [currentLevel, resetBackend, loadModel]
   );
 
-  const handleParticipantIdChange = useCallback(
-    (id: string) => {
-      setParticipantId(id);
-      // Bei laufender Session: neu starten mit aktualisierter ID
-      benchmarkExporter.reset();
-      benchmarkExporter.startSession(id, currentLevel);
-      sessionStartedRef.current = true;
+  const handleThreadingChange = useCallback(
+    async (mode: 'single' | 'multi') => {
+      if (mode === threadingPreference) return;
+      setThreadingPreference(mode);
+      // Backend muss vollständig neu für anderen Threading-Modus
+      await resetBackend();
+      await loadModel(currentLevel);
     },
-    [currentLevel]
+    [
+      threadingPreference,
+      setThreadingPreference,
+      resetBackend,
+      loadModel,
+      currentLevel,
+    ]
   );
 
   const handleExport = useCallback(() => {
     benchmarkExporter.downloadJSON();
   }, []);
 
-  // Pro Frame in der Analyse-Phase: Messdaten an Exporter weiterreichen
+  const handleSideLocked = useCallback((side: BodySide) => {
+    benchmarkExporter.setLockedSide(side);
+  }, []);
+
+  const handleRecordingFinalize = useCallback(
+    (interpolated: number, cycles: number) => {
+      benchmarkExporter.finalizeMetrics(interpolated, cycles);
+      setLastSummary({ interpolated, cycles });
+    },
+    []
+  );
+
   const handleFrameMeasurement = useCallback(
     (pose: Pose) => {
       const m = lastMeasurementRef.current;
       if (!m) return;
-
       const kp = pose.keypoints;
       const kneeRight = calculateKneeAngle(
         kp[KP.RIGHT_HIP],
@@ -126,7 +116,6 @@ function App() {
         kp[KP.LEFT_KNEE],
         kp[KP.LEFT_ANKLE]
       );
-
       benchmarkExporter.recordFrame({
         frameIndex: m.frameIndex,
         timestampMs: performance.now(),
@@ -141,193 +130,60 @@ function App() {
     [lastMeasurementRef]
   );
 
-  const renderContent = () => {
-    switch (currentView) {
-      case 'analysis':
-        return (
-          <div className="grid lg:grid-cols-[1fr,320px] gap-6">
-            <AnalysisView
-              detectPose={detectPose}
-              isDetectorReady={!isLoading && detector !== null}
-              onComplete={handleAnalysisComplete}
-              onCancel={handleBackToHome}
-              targetCycles={5}
-              onFrameMeasurement={handleFrameMeasurement}
-            />
-            <div className="space-y-4">
-              <QuantizationControls
-                currentLevel={currentLevel}
-                onLevelChange={handleLevelChange}
-                isLoading={isLoading}
-                isWarmingUp={isWarmingUp}
-                participantId={participantId}
-                onParticipantIdChange={handleParticipantIdChange}
-                onExport={handleExport}
-              />
-              <MetricsOverlay
-                inferenceTime={metrics.inferenceTime}
-                fps={metrics.fps}
-                frameCount={metrics.frameCount}
-                kneeAngle={kneeAngle}
-                hipAngle={hipAngle}
-              />
-            </div>
-          </div>
-        );
+  const handleAnalysisComplete = useCallback(
+    (results: AnalysisResults) => setAnalysisResults(results),
+    []
+  );
 
-      case 'results':
-        if (!analysisResults) {
-          setCurrentView('home');
-          return null;
-        }
-        return (
-          <ResultsDashboard
-            results={analysisResults}
-            onNewAnalysis={handleNewAnalysis}
-            onShowHistory={() => setCurrentView('history')}
-          />
-        );
-
-      case 'history':
-        return (
-          <HistoryView
-            onSelectEntry={handleSelectHistoryEntry}
-            onBack={handleBackToHome}
-            onNewAnalysis={handleStartAnalysis}
-          />
-        );
-
-      case 'home':
-      default:
-        return (
-          <div className="grid lg:grid-cols-[1fr,320px] gap-6">
-            <div>
-              <VideoCanvas
-                poses={poses}
-                onDetect={async (v) => {
-                  await detectPose(v);
-                }}
-                isDetectorReady={!isLoading && detector !== null}
-                onAnglesUpdate={handleAnglesUpdate}
-              />
-
-              <div className="mt-4 flex flex-col sm:flex-row gap-3">
-                <button
-                  onClick={handleStartAnalysis}
-                  disabled={!detector}
-                  className={`flex-1 py-3 px-6 rounded-lg font-semibold transition-all flex items-center justify-center gap-2 ${
-                    detector
-                      ? 'bg-green-500 hover:bg-green-600 text-white'
-                      : 'bg-gray-600 text-gray-400 cursor-not-allowed'
-                  }`}
-                >
-                  Biomechanische Analyse starten
-                </button>
-                <button
-                  onClick={() => setCurrentView('history')}
-                  className="py-3 px-6 rounded-lg font-semibold bg-gray-700 hover:bg-gray-600 text-gray-300 transition-all flex items-center justify-center gap-2"
-                >
-                  Verlauf
-                </button>
-              </div>
-
-              <div className="mt-4 p-4 bg-gray-800/50 rounded-lg border border-gray-700">
-                <h3 className="font-semibold text-green-400 mb-2">Anleitung</h3>
-                <ul className="text-sm text-gray-400 space-y-1">
-                  <li>
-                    • Positioniere dich seitlich zur Kamera auf dem Fahrrad
-                  </li>
-                  <li>
-                    • Schulter, Hüfte, Knie und Knöchel müssen sichtbar sein
-                  </li>
-                  <li>
-                    • Optimaler Kniewinkel am unteren Totpunkt: 140° - 150°
-                  </li>
-                  <li>
-                    • Grün = optimal, Gelb = akzeptabel, Rot = Anpassung
-                  </li>
-                </ul>
-              </div>
-            </div>
-
-            <div className="space-y-4">
-              <MetricsOverlay
-                inferenceTime={metrics.inferenceTime}
-                fps={metrics.fps}
-                frameCount={metrics.frameCount}
-                kneeAngle={kneeAngle}
-                hipAngle={hipAngle}
-              />
-
-              <div className="bg-gray-800/50 rounded-lg p-4 border border-gray-700">
-                <h3 className="font-semibold text-gray-300 mb-3 text-sm">
-                  Technische Details
-                </h3>
-                <div className="space-y-2 text-xs">
-                  <InfoRow label="Modell" value="MoveNet Lightning (TFLite)" />
-                  <InfoRow label="Backend" value="WASM" />
-                  <InfoRow
-                    label="Quantisierung"
-                    value={currentLevel.toUpperCase()}
-                  />
-                  <InfoRow label="Verarbeitung" value="100% lokal" />
-                </div>
-              </div>
-
-              <div className="bg-green-900/30 rounded-lg p-4 border border-green-700/50">
-                <span className="font-semibold text-sm text-green-400">
-                  Privacy-First
-                </span>
-                <p className="text-xs text-gray-400 mt-2">
-                  Alle Daten werden lokal im Browser verarbeitet. Kein Upload.
-                </p>
-              </div>
-            </div>
-          </div>
-        );
-    }
-  };
+  const handleResetSession = useCallback(() => {
+    setAnalysisResults(null);
+    setLastSummary(null);
+    benchmarkExporter.reset();
+    benchmarkExporter.startSession(participantId, currentLevel);
+    benchmarkExporter.setLockedSide(forcedSide);
+    benchmarkExporter.setModelFingerprint(modelFingerprint);
+    benchmarkExporter.setThreadingMode(activeThreadingMode);
+    benchmarkExporter.setVideoSource(videoMode, videoFile?.name);
+  }, [
+    participantId,
+    currentLevel,
+    forcedSide,
+    modelFingerprint,
+    activeThreadingMode,
+    videoMode,
+    videoFile,
+  ]);
 
   return (
     <div className="min-h-screen bg-gradient-to-br from-gray-900 via-gray-800 to-gray-900">
       <header className="bg-gray-900/80 backdrop-blur-sm border-b border-gray-700 sticky top-0 z-10">
         <div className="max-w-7xl mx-auto px-4 py-4">
           <div className="flex items-center justify-between">
-            <div className="cursor-pointer" onClick={handleBackToHome}>
+            <div>
               <h1 className="text-2xl font-bold text-white">
                 EdgeFit <span className="text-green-400">Pro</span>
               </h1>
               <p className="text-sm text-gray-400">
-                MoveNet TFLite • Quantisierungs-Benchmark
+                Kniewinkel-Messung · Quantisierungs-Benchmark
               </p>
             </div>
-            <div className="flex items-center gap-4">
-              {currentView !== 'home' && (
-                <button
-                  onClick={handleBackToHome}
-                  className="text-sm text-gray-400 hover:text-white transition-colors"
-                >
-                  Home
-                </button>
-              )}
-              <div className="flex items-center gap-2">
-                <div
-                  className={`w-3 h-3 rounded-full ${
-                    detector
-                      ? isWarmingUp
-                        ? 'bg-yellow-400 animate-pulse'
-                        : 'bg-green-400 animate-pulse'
-                      : 'bg-yellow-400'
-                  }`}
-                />
-                <span className="text-sm text-gray-400 font-mono">
-                  {!detector
-                    ? 'Lädt...'
-                    : isWarmingUp
-                    ? `Warmup (${currentLevel})`
-                    : `Bereit (${currentLevel})`}
-                </span>
-              </div>
+            <div className="flex items-center gap-2">
+              <div
+                className={`w-3 h-3 rounded-full ${
+                  detector
+                    ? isWarmingUp
+                      ? 'bg-yellow-400 animate-pulse'
+                      : 'bg-green-400 animate-pulse'
+                    : 'bg-yellow-400'
+                }`}
+              />
+              <span className="text-sm text-gray-400 font-mono">
+                {!detector
+                  ? 'Lädt...'
+                  : isWarmingUp
+                  ? `Warmup (${currentLevel})`
+                  : `Bereit (${currentLevel}/${activeThreadingMode})`}
+              </span>
             </div>
           </div>
         </div>
@@ -340,28 +196,143 @@ function App() {
           </div>
         )}
 
-        {renderContent()}
+        <div className="grid lg:grid-cols-[1fr,340px] gap-6">
+          <AnalysisView
+            detectPose={detectPose}
+            isDetectorReady={!isLoading && detector !== null}
+            onComplete={handleAnalysisComplete}
+            onCancel={handleResetSession}
+            targetCycles={5}
+            onFrameMeasurement={handleFrameMeasurement}
+            onSideLocked={handleSideLocked}
+            onRecordingFinalize={handleRecordingFinalize}
+            videoMode={videoMode}
+            videoFile={videoFile}
+            forcedSide={forcedSide}
+          />
+
+          <div className="space-y-4">
+            <VideoSourcePanel
+              mode={videoMode}
+              onModeChange={setVideoMode}
+              file={videoFile}
+              onFileChange={setVideoFile}
+              participantId={participantId}
+            />
+
+            <QuantizationControls
+              currentLevel={currentLevel}
+              onLevelChange={handleLevelChange}
+              isLoading={isLoading}
+              isWarmingUp={isWarmingUp}
+              participantId={participantId}
+              onParticipantIdChange={setParticipantId}
+              onExport={handleExport}
+              forcedSide={forcedSide}
+              onForcedSideChange={setForcedSide}
+              threadingPreference={threadingPreference}
+              onThreadingPreferenceChange={handleThreadingChange}
+              multiThreadingAvailable={multiThreadingAvailable}
+              activeThreadingMode={activeThreadingMode}
+            />
+
+            <div className="bg-gray-800/50 rounded-lg p-4 border border-gray-700 text-xs space-y-1">
+              <div className="flex justify-between">
+                <span className="text-gray-500">Inferenz</span>
+                <span className="text-gray-300 font-mono">
+                  {metrics.inferenceTime.toFixed(1)} ms
+                </span>
+              </div>
+              <div className="flex justify-between">
+                <span className="text-gray-500">FPS</span>
+                <span className="text-gray-300 font-mono">
+                  {metrics.fps.toFixed(1)}
+                </span>
+              </div>
+              <div className="flex justify-between">
+                <span className="text-gray-500">Frames</span>
+                <span className="text-gray-300 font-mono">
+                  {metrics.frameCount}
+                </span>
+              </div>
+              {modelFingerprint && (
+                <div className="pt-2 border-t border-gray-700">
+                  <div className="flex justify-between text-gray-500">
+                    <span>SHA-256</span>
+                    <span className="font-mono text-gray-400">
+                      {modelFingerprint.sha256.substring(0, 12)}…
+                    </span>
+                  </div>
+                  <div className="flex justify-between text-gray-500">
+                    <span>Bytes</span>
+                    <span className="font-mono">
+                      {(modelFingerprint.sizeBytes / 1024 / 1024).toFixed(2)} MB
+                    </span>
+                  </div>
+                </div>
+              )}
+            </div>
+
+            {analysisResults && (
+              <div className="bg-gray-800/50 rounded-lg p-4 border border-green-700/40 text-xs space-y-1">
+                <div className="text-sm font-semibold text-green-400 mb-1">
+                  Letzte Aufnahme abgeschlossen
+                </div>
+                <div className="flex justify-between text-gray-400">
+                  <span>Zyklen</span>
+                  <span className="font-mono">
+                    {analysisResults.cycleCount}
+                  </span>
+                </div>
+                <div className="flex justify-between text-gray-400">
+                  <span>Dauer</span>
+                  <span className="font-mono">
+                    {(analysisResults.duration / 1000).toFixed(1)} s
+                  </span>
+                </div>
+                <div className="flex justify-between text-gray-400">
+                  <span>Knie max ⌀</span>
+                  <span className="font-mono">
+                    {analysisResults.statistics.kneeExtension.average.toFixed(
+                      1
+                    )}
+                    °
+                  </span>
+                </div>
+                <div className="flex justify-between text-gray-400">
+                  <span>Knie min ⌀</span>
+                  <span className="font-mono">
+                    {analysisResults.statistics.kneeFlexion.average.toFixed(
+                      1
+                    )}
+                    °
+                  </span>
+                </div>
+                {lastSummary && (
+                  <div className="flex justify-between text-gray-400">
+                    <span>Interpoliert</span>
+                    <span className="font-mono">
+                      {lastSummary.interpolated}
+                    </span>
+                  </div>
+                )}
+                <button
+                  onClick={handleResetSession}
+                  className="mt-2 w-full py-1.5 px-3 rounded-md text-xs bg-gray-700 hover:bg-gray-600 text-gray-200"
+                >
+                  Neue Aufnahme
+                </button>
+              </div>
+            )}
+          </div>
+        </div>
       </main>
 
       <footer className="mt-8 border-t border-gray-800 bg-gray-900/50">
         <div className="max-w-7xl mx-auto px-4 py-4 text-center text-xs text-gray-500">
-          EdgeFit Pro • Bachelorarbeit FOM • TFLite + React
+          EdgeFit Pro · Bachelorarbeit FOM · TFLite + React
         </div>
       </footer>
-    </div>
-  );
-}
-
-interface InfoRowProps {
-  label: string;
-  value: string;
-}
-
-function InfoRow({ label, value }: InfoRowProps) {
-  return (
-    <div className="flex justify-between">
-      <span className="text-gray-500">{label}</span>
-      <span className="text-gray-300 font-mono">{value}</span>
     </div>
   );
 }

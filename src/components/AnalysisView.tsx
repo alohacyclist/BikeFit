@@ -1,58 +1,34 @@
 import { useRef, useEffect, useCallback, useState } from 'react';
-import * as poseDetection from '@tensorflow-models/pose-detection';
 import {
   calculateKneeAngle,
-  calculateHipAngle,
-  calculateAnkleAngle,
-  calculateElbowAngle,
-  calculateBackAngle,
   getAngleColor,
+  isKneeTripleValid,
+  SIDE_KEYPOINTS,
+  type BodySide,
   BiomechanicalAngles,
   type Keypoint,
 } from '../utils/AngleCalculator';
 import {
   BiomechanicalAnalyzer,
   AnalysisResults,
+  type CyclePhase,
 } from '../services/BiomechanicalAnalyzer';
 import type { Pose } from '../hooks/usePoseDetection';
-
-// MoveNet Keypoint-Indizes
-const KEYPOINT_INDICES = {
-  nose: 0,
-  leftEye: 1,
-  rightEye: 2,
-  leftEar: 3,
-  rightEar: 4,
-  leftShoulder: 5,
-  rightShoulder: 6,
-  leftElbow: 7,
-  rightElbow: 8,
-  leftWrist: 9,
-  rightWrist: 10,
-  leftHip: 11,
-  rightHip: 12,
-  leftKnee: 13,
-  rightKnee: 14,
-  leftAnkle: 15,
-  rightAnkle: 16,
-};
+import {
+  useVideoSource,
+  type VideoSourceMode,
+} from '../hooks/useVideoSource';
 
 const SKELETON_CONNECTIONS: [number, number][] = [
-  [KEYPOINT_INDICES.leftShoulder, KEYPOINT_INDICES.rightShoulder],
-  [KEYPOINT_INDICES.leftShoulder, KEYPOINT_INDICES.leftElbow],
-  [KEYPOINT_INDICES.leftElbow, KEYPOINT_INDICES.leftWrist],
-  [KEYPOINT_INDICES.rightShoulder, KEYPOINT_INDICES.rightElbow],
-  [KEYPOINT_INDICES.rightElbow, KEYPOINT_INDICES.rightWrist],
-  [KEYPOINT_INDICES.leftShoulder, KEYPOINT_INDICES.leftHip],
-  [KEYPOINT_INDICES.rightShoulder, KEYPOINT_INDICES.rightHip],
-  [KEYPOINT_INDICES.leftHip, KEYPOINT_INDICES.rightHip],
-  [KEYPOINT_INDICES.leftHip, KEYPOINT_INDICES.leftKnee],
-  [KEYPOINT_INDICES.leftKnee, KEYPOINT_INDICES.leftAnkle],
-  [KEYPOINT_INDICES.rightHip, KEYPOINT_INDICES.rightKnee],
-  [KEYPOINT_INDICES.rightKnee, KEYPOINT_INDICES.rightAnkle],
+  [5, 6], [5, 7], [7, 9], [6, 8], [8, 10],
+  [5, 11], [6, 12], [11, 12], [11, 13], [13, 15], [12, 14], [14, 16],
 ];
 
-type AnalysisPhase = 'setup' | 'recording' | 'complete';
+type AnalysisPhase = 'setup' | 'countdown' | 'recording' | 'complete';
+
+const COUNTDOWN_SECONDS = 15;
+const SETUP_SIDE_WINDOW = 30;
+const RECORDING_AUTOSTOP_MS = 60000;
 
 interface AnalysisViewProps {
   detectPose: (video: HTMLVideoElement) => Promise<Pose | null>;
@@ -60,8 +36,37 @@ interface AnalysisViewProps {
   onComplete: (results: AnalysisResults) => void;
   onCancel: () => void;
   targetCycles?: number;
-  // Optionaler Frame-Hook für Benchmark-Recording (nur während 'recording')
   onFrameMeasurement?: (pose: Pose) => void;
+  onSideLocked?: (side: BodySide) => void;
+  onRecordingFinalize?: (interpolatedFrames: number, cyclesDetected: number) => void;
+
+  /** Video-Quelle (Webcam oder Datei-Replay). */
+  videoMode: VideoSourceMode;
+  videoFile: File | null;
+  /** Wenn gesetzt: überschreibt die runtime-Auto-Detection für Side-Lock. */
+  forcedSide?: BodySide | null;
+  /** Im File-Modus: Countdown überspringen (Auto-Start). */
+  skipCountdownInFileMode?: boolean;
+}
+
+function beep(freq: number, durationMs: number, gain = 0.15): void {
+  try {
+    const Ctx =
+      window.AudioContext ||
+      (window as unknown as { webkitAudioContext: typeof AudioContext })
+        .webkitAudioContext;
+    const ctx = new Ctx();
+    const osc = ctx.createOscillator();
+    const g = ctx.createGain();
+    osc.frequency.value = freq;
+    g.gain.value = gain;
+    osc.connect(g).connect(ctx.destination);
+    osc.start();
+    osc.stop(ctx.currentTime + durationMs / 1000);
+    osc.onended = () => ctx.close();
+  } catch {
+    // no audio
+  }
 }
 
 export function AnalysisView({
@@ -71,63 +76,52 @@ export function AnalysisView({
   onCancel,
   targetCycles = 5,
   onFrameMeasurement,
+  onSideLocked,
+  onRecordingFinalize,
+  videoMode,
+  videoFile,
+  forcedSide,
+  skipCountdownInFileMode = true,
 }: AnalysisViewProps) {
   const videoRef = useRef<HTMLVideoElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const animationRef = useRef<number>(0);
   const analyzerRef = useRef<BiomechanicalAnalyzer | null>(null);
   const onFrameRef = useRef(onFrameMeasurement);
+  const recordingStartRef = useRef<number>(0);
+
+  const sideHistoryRef = useRef<{ left: number[]; right: number[] }>({
+    left: [],
+    right: [],
+  });
 
   const [phase, setPhase] = useState<AnalysisPhase>('setup');
+  const [countdown, setCountdown] = useState<number>(COUNTDOWN_SECONDS);
   const [cycleCount, setCycleCount] = useState(0);
+  const [cyclePhase, setCyclePhase] = useState<CyclePhase>('searching');
   const [currentAngles, setCurrentAngles] = useState<BiomechanicalAngles>({
     knee: null,
-    hip: null,
-    ankle: null,
-    elbow: null,
-    back: null,
   });
-  const [poseConfidence, setPoseConfidence] = useState(0);
+  const [lockedSide, setLockedSide] = useState<BodySide | null>(null);
+  const [recommendedSide, setRecommendedSide] =
+    useState<BodySide>('right');
+  const [kpScores, setKpScores] = useState<{
+    left: { hip: number; knee: number; ankle: number };
+    right: { hip: number; knee: number; ankle: number };
+  }>({
+    left: { hip: 0, knee: 0, ankle: 0 },
+    right: { hip: 0, knee: 0, ankle: 0 },
+  });
 
   useEffect(() => {
     onFrameRef.current = onFrameMeasurement;
   }, [onFrameMeasurement]);
 
-  // Webcam initialisieren
-  useEffect(() => {
-    async function setupCamera() {
-      if (!videoRef.current) return;
-      try {
-        const stream = await navigator.mediaDevices.getUserMedia({
-          video: {
-            width: { ideal: 1280 },
-            height: { ideal: 720 },
-            frameRate: { ideal: 30, max: 60 },
-          },
-          audio: false,
-        });
-
-        videoRef.current.srcObject = stream;
-        await new Promise<void>((resolve) => {
-          if (videoRef.current) {
-            videoRef.current.onloadedmetadata = () => resolve();
-          }
-        });
-        await videoRef.current.play();
-      } catch (err) {
-        console.error('Webcam Zugriff fehlgeschlagen:', err);
-      }
-    }
-
-    setupCamera();
-
-    return () => {
-      if (videoRef.current?.srcObject) {
-        const stream = videoRef.current.srcObject as MediaStream;
-        stream.getTracks().forEach((track) => track.stop());
-      }
-    };
-  }, []);
+  // Video-Quelle aktiv halten (Webcam-Stream oder File-Backed)
+  const sourceState = useVideoSource(videoRef, {
+    mode: videoMode,
+    file: videoFile,
+  });
 
   useEffect(() => {
     analyzerRef.current = new BiomechanicalAnalyzer({ targetCycles });
@@ -136,37 +130,85 @@ export function AnalysisView({
     };
   }, [targetCycles]);
 
+  // Countdown — nur im Webcam-Modus, im File-Modus optional überspringbar
+  useEffect(() => {
+    if (phase !== 'countdown') return;
+    setCountdown(COUNTDOWN_SECONDS);
+    let remaining = COUNTDOWN_SECONDS;
+    beep(660, 120);
+    const id = setInterval(() => {
+      remaining -= 1;
+      setCountdown(remaining);
+      if (remaining > 0 && remaining <= 3) beep(660, 120);
+      if (remaining <= 0) {
+        clearInterval(id);
+        beep(990, 250);
+        startRecording();
+      }
+    }, 1000);
+    return () => clearInterval(id);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [phase]);
+
+  const lockSide = useCallback((): BodySide => {
+    if (forcedSide) return forcedSide;
+    const hist = sideHistoryRef.current;
+    const meanL =
+      hist.left.length === 0
+        ? 0
+        : hist.left.reduce((a, b) => a + b, 0) / hist.left.length;
+    const meanR =
+      hist.right.length === 0
+        ? 0
+        : hist.right.reduce((a, b) => a + b, 0) / hist.right.length;
+    return meanR >= meanL ? 'right' : 'left';
+  }, [forcedSide]);
+
+  const startRecording = useCallback(() => {
+    const side = lockSide();
+    setLockedSide(side);
+    onSideLocked?.(side);
+    analyzerRef.current?.reset();
+    setCycleCount(0);
+    recordingStartRef.current = performance.now();
+    // Im File-Modus: Video von vorne starten und abspielen
+    if (videoMode === 'file' && videoRef.current) {
+      videoRef.current.currentTime = 0;
+      videoRef.current
+        .play()
+        .catch((e) => console.error('Video-Play fehlgeschlagen:', e));
+    }
+    setPhase('recording');
+  }, [lockSide, onSideLocked, videoMode]);
+
   const drawSkeleton = useCallback(
     (
       ctx: CanvasRenderingContext2D,
-      keypoints: poseDetection.Keypoint[],
-      minConfidence: number = 0.3
+      keypoints: { x: number; y: number; score?: number }[],
+      minConfidence = 0.2
     ) => {
       ctx.strokeStyle = '#00ff88';
       ctx.lineWidth = 3;
-
-      for (const [startIdx, endIdx] of SKELETON_CONNECTIONS) {
-        const start = keypoints[startIdx];
-        const end = keypoints[endIdx];
-
+      for (const [s, e] of SKELETON_CONNECTIONS) {
+        const a = keypoints[s];
+        const b = keypoints[e];
         if (
-          start.score !== undefined &&
-          start.score > minConfidence &&
-          end.score !== undefined &&
-          end.score > minConfidence
+          a?.score !== undefined &&
+          a.score > minConfidence &&
+          b?.score !== undefined &&
+          b.score > minConfidence
         ) {
           ctx.beginPath();
-          ctx.moveTo(start.x, start.y);
-          ctx.lineTo(end.x, end.y);
+          ctx.moveTo(a.x, a.y);
+          ctx.lineTo(b.x, b.y);
           ctx.stroke();
         }
       }
-
-      for (const keypoint of keypoints) {
-        if (keypoint.score !== undefined && keypoint.score > minConfidence) {
+      for (const kp of keypoints) {
+        if (kp?.score !== undefined && kp.score > minConfidence) {
           ctx.fillStyle = '#ff0066';
           ctx.beginPath();
-          ctx.arc(keypoint.x, keypoint.y, 6, 0, 2 * Math.PI);
+          ctx.arc(kp.x, kp.y, 6, 0, 2 * Math.PI);
           ctx.fill();
           ctx.strokeStyle = '#ffffff';
           ctx.lineWidth = 2;
@@ -180,45 +222,35 @@ export function AnalysisView({
   const drawAngleOverlay = useCallback(
     (
       ctx: CanvasRenderingContext2D,
-      position: { x: number; y: number },
+      pos: { x: number; y: number },
       angle: number,
       label: string
     ) => {
       const color = getAngleColor(angle);
       const text = `${label}: ${angle.toFixed(0)}°`;
-
       ctx.font = 'bold 14px monospace';
-      const textMetrics = ctx.measureText(text);
-      const padding = 4;
-
-      ctx.fillStyle = 'rgba(0, 0, 0, 0.8)';
-      ctx.fillRect(
-        position.x - padding,
-        position.y - 16 - padding,
-        textMetrics.width + padding * 2,
-        20 + padding
-      );
-
+      const m = ctx.measureText(text);
+      const p = 4;
+      ctx.fillStyle = 'rgba(0,0,0,0.8)';
+      ctx.fillRect(pos.x - p, pos.y - 16 - p, m.width + p * 2, 20 + p);
       ctx.fillStyle = color;
-      ctx.fillText(text, position.x, position.y - 4);
+      ctx.fillText(text, pos.x, pos.y - 4);
     },
     []
   );
 
   // Recording-Loop
   useEffect(() => {
-    if (!isDetectorReady || phase !== 'recording') return;
+    if (!isDetectorReady || phase !== 'recording' || !lockedSide) return;
 
     const renderLoop = async () => {
       const video = videoRef.current;
       const canvas = canvasRef.current;
       const analyzer = analyzerRef.current;
-
       if (!video || !canvas || !analyzer || video.readyState < 2) {
         animationRef.current = requestAnimationFrame(renderLoop);
         return;
       }
-
       if (
         canvas.width !== video.videoWidth ||
         canvas.height !== video.videoHeight
@@ -226,7 +258,6 @@ export function AnalysisView({
         canvas.width = video.videoWidth;
         canvas.height = video.videoHeight;
       }
-
       const ctx = canvas.getContext('2d');
       if (!ctx) {
         animationRef.current = requestAnimationFrame(renderLoop);
@@ -236,95 +267,77 @@ export function AnalysisView({
       const pose = await detectPose(video);
 
       ctx.save();
-      ctx.scale(-1, 1);
-      ctx.drawImage(video, -canvas.width, 0, canvas.width, canvas.height);
+      if (videoMode === 'webcam') {
+        ctx.scale(-1, 1);
+        ctx.drawImage(
+          video,
+          -canvas.width,
+          0,
+          canvas.width,
+          canvas.height
+        );
+      } else {
+        ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+      }
       ctx.restore();
 
       if (pose) {
-        // Frame-Recording (Benchmark) — Pose im Original (unmirrored) übergeben
-        if (onFrameRef.current) {
-          onFrameRef.current(pose);
-        }
+        if (onFrameRef.current) onFrameRef.current(pose);
 
-        const mirroredKeypoints = pose.keypoints.map((kp) => ({
-          ...kp,
-          x: canvas.width - kp.x,
-        }));
+        // Im Webcam-Modus spiegeln, im File-Modus 1:1
+        const drawKeypoints =
+          videoMode === 'webcam'
+            ? pose.keypoints.map((kp) => ({
+                ...kp,
+                x: canvas.width - kp.x,
+              }))
+            : pose.keypoints;
 
-        drawSkeleton(ctx, mirroredKeypoints);
+        drawSkeleton(ctx, drawKeypoints);
 
-        const leftHip = mirroredKeypoints[KEYPOINT_INDICES.leftHip] as Keypoint;
-        const leftKnee = mirroredKeypoints[
-          KEYPOINT_INDICES.leftKnee
-        ] as Keypoint;
-        const leftAnkle = mirroredKeypoints[
-          KEYPOINT_INDICES.leftAnkle
-        ] as Keypoint;
-        const leftShoulder = mirroredKeypoints[
-          KEYPOINT_INDICES.leftShoulder
-        ] as Keypoint;
-        const leftElbow = mirroredKeypoints[
-          KEYPOINT_INDICES.leftElbow
-        ] as Keypoint;
-        const leftWrist = mirroredKeypoints[
-          KEYPOINT_INDICES.leftWrist
-        ] as Keypoint;
+        const ix = SIDE_KEYPOINTS[lockedSide];
+        // Knie-Winkel auf den ORIGINAL-Keypoints rechnen, nicht gespiegelt
+        const hip = pose.keypoints[ix.hip] as Keypoint;
+        const knee = pose.keypoints[ix.knee] as Keypoint;
+        const ankle = pose.keypoints[ix.ankle] as Keypoint;
 
         const angles: BiomechanicalAngles = {
-          knee: calculateKneeAngle(leftHip, leftKnee, leftAnkle),
-          hip: calculateHipAngle(leftShoulder, leftHip, leftKnee),
-          ankle: calculateAnkleAngle(leftKnee, leftAnkle),
-          elbow: calculateElbowAngle(leftShoulder, leftElbow, leftWrist),
-          back: calculateBackAngle(leftShoulder, leftHip),
+          knee: calculateKneeAngle(hip, knee, ankle),
         };
 
-        const relevantKeypoints = [
-          leftHip,
-          leftKnee,
-          leftAnkle,
-          leftShoulder,
-          leftElbow,
-        ];
+        const relevant = [hip, knee, ankle];
         const avgConfidence =
-          relevantKeypoints.reduce((sum, kp) => sum + (kp.score || 0), 0) /
-          relevantKeypoints.length;
+          relevant.reduce((s, k) => s + (k.score || 0), 0) / relevant.length;
 
         analyzer.addFrame(angles, avgConfidence);
         setCurrentAngles(angles);
-        setPoseConfidence(avgConfidence);
         setCycleCount(analyzer.getCycleCount());
+        setCyclePhase(analyzer.getCurrentPhase());
 
         if (angles.knee !== null) {
+          const drawKnee = drawKeypoints[ix.knee];
           drawAngleOverlay(
             ctx,
-            { x: leftKnee.x + 15, y: leftKnee.y },
+            { x: drawKnee.x + 15, y: drawKnee.y },
             angles.knee,
             'Knie'
           );
         }
-        if (angles.hip !== null) {
-          drawAngleOverlay(
-            ctx,
-            { x: leftHip.x + 15, y: leftHip.y },
-            angles.hip,
-            'Hüfte'
-          );
-        }
-        if (angles.back !== null) {
-          drawAngleOverlay(
-            ctx,
-            { x: leftShoulder.x + 15, y: leftShoulder.y - 30 },
-            angles.back,
-            'Rücken'
-          );
-        }
 
-        if (analyzer.isComplete()) {
-          setPhase('complete');
+        const elapsed = performance.now() - recordingStartRef.current;
+        const videoEnded = videoMode === 'file' && video.ended;
+        if (
+          analyzer.isComplete() ||
+          elapsed > RECORDING_AUTOSTOP_MS ||
+          videoEnded
+        ) {
           const results = analyzer.getResults();
-          if (results) {
-            onComplete(results);
-          }
+          setPhase('complete');
+          onRecordingFinalize?.(
+            analyzer.getInterpolatedFramesCount(),
+            analyzer.getCycleCount()
+          );
+          if (results) onComplete(results);
           return;
         }
       }
@@ -333,32 +346,34 @@ export function AnalysisView({
     };
 
     animationRef.current = requestAnimationFrame(renderLoop);
-
-    return () => {
-      cancelAnimationFrame(animationRef.current);
-    };
+    return () => cancelAnimationFrame(animationRef.current);
   }, [
     isDetectorReady,
     detectPose,
     phase,
+    lockedSide,
+    videoMode,
     drawSkeleton,
     drawAngleOverlay,
     onComplete,
+    onRecordingFinalize,
   ]);
 
-  // Setup-Loop (Live-Preview ohne Analyse)
+  // Setup-Loop (Live-Preview + Side-Quality)
   useEffect(() => {
-    if (!isDetectorReady || phase !== 'setup') return;
+    if (
+      !isDetectorReady ||
+      (phase !== 'setup' && phase !== 'countdown')
+    )
+      return;
 
     const renderLoop = async () => {
       const video = videoRef.current;
       const canvas = canvasRef.current;
-
       if (!video || !canvas || video.readyState < 2) {
         animationRef.current = requestAnimationFrame(renderLoop);
         return;
       }
-
       if (
         canvas.width !== video.videoWidth ||
         canvas.height !== video.videoHeight
@@ -366,7 +381,6 @@ export function AnalysisView({
         canvas.width = video.videoWidth;
         canvas.height = video.videoHeight;
       }
-
       const ctx = canvas.getContext('2d');
       if (!ctx) {
         animationRef.current = requestAnimationFrame(renderLoop);
@@ -376,54 +390,99 @@ export function AnalysisView({
       const pose = await detectPose(video);
 
       ctx.save();
-      ctx.scale(-1, 1);
-      ctx.drawImage(video, -canvas.width, 0, canvas.width, canvas.height);
+      if (videoMode === 'webcam') {
+        ctx.scale(-1, 1);
+        ctx.drawImage(
+          video,
+          -canvas.width,
+          0,
+          canvas.width,
+          canvas.height
+        );
+      } else {
+        ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+      }
       ctx.restore();
 
       if (pose) {
-        const mirroredKeypoints = pose.keypoints.map((kp) => ({
-          ...kp,
-          x: canvas.width - kp.x,
-        }));
-        drawSkeleton(ctx, mirroredKeypoints);
+        const drawKeypoints =
+          videoMode === 'webcam'
+            ? pose.keypoints.map((kp) => ({
+                ...kp,
+                x: canvas.width - kp.x,
+              }))
+            : pose.keypoints;
+        drawSkeleton(ctx, drawKeypoints);
 
-        const relevantKeypoints = [
-          mirroredKeypoints[KEYPOINT_INDICES.leftHip],
-          mirroredKeypoints[KEYPOINT_INDICES.leftKnee],
-          mirroredKeypoints[KEYPOINT_INDICES.leftAnkle],
-          mirroredKeypoints[KEYPOINT_INDICES.leftShoulder],
-        ];
-        const avgConfidence =
-          relevantKeypoints.reduce((sum, kp) => sum + (kp.score || 0), 0) /
-          relevantKeypoints.length;
-        setPoseConfidence(avgConfidence);
+        const vL = isKneeTripleValid(pose.keypoints, 'left');
+        const vR = isKneeTripleValid(pose.keypoints, 'right');
+        const hist = sideHistoryRef.current;
+        hist.left.push(vL);
+        hist.right.push(vR);
+        if (hist.left.length > SETUP_SIDE_WINDOW) hist.left.shift();
+        if (hist.right.length > SETUP_SIDE_WINDOW) hist.right.shift();
+        const meanL =
+          hist.left.reduce((a, b) => a + b, 0) / hist.left.length;
+        const meanR =
+          hist.right.reduce((a, b) => a + b, 0) / hist.right.length;
+        setRecommendedSide(meanR >= meanL ? 'right' : 'left');
+
+        const ixL = SIDE_KEYPOINTS.left;
+        const ixR = SIDE_KEYPOINTS.right;
+        setKpScores({
+          left: {
+            hip: pose.keypoints[ixL.hip]?.score ?? 0,
+            knee: pose.keypoints[ixL.knee]?.score ?? 0,
+            ankle: pose.keypoints[ixL.ankle]?.score ?? 0,
+          },
+          right: {
+            hip: pose.keypoints[ixR.hip]?.score ?? 0,
+            knee: pose.keypoints[ixR.knee]?.score ?? 0,
+            ankle: pose.keypoints[ixR.ankle]?.score ?? 0,
+          },
+        });
       }
 
       animationRef.current = requestAnimationFrame(renderLoop);
     };
 
     animationRef.current = requestAnimationFrame(renderLoop);
+    return () => cancelAnimationFrame(animationRef.current);
+  }, [isDetectorReady, detectPose, phase, drawSkeleton, videoMode]);
 
-    return () => {
-      cancelAnimationFrame(animationRef.current);
-    };
-  }, [isDetectorReady, detectPose, phase, drawSkeleton]);
-
-  const handleStartAnalysis = () => {
-    if (analyzerRef.current) {
-      analyzerRef.current.reset();
+  const handleStart = () => {
+    if (videoMode === 'file' && skipCountdownInFileMode) {
+      // Datei-Replay: kein Countdown nötig
+      startRecording();
+    } else {
+      setPhase('countdown');
     }
-    setCycleCount(0);
-    setPhase('recording');
   };
 
-  const handleStopAnalysis = () => {
+  const handleStop = () => {
+    const analyzer = analyzerRef.current;
+    if (analyzer) {
+      onRecordingFinalize?.(
+        analyzer.getInterpolatedFramesCount(),
+        analyzer.getCycleCount()
+      );
+      analyzer.reset();
+    }
+    setLockedSide(null);
+    setCycleCount(0);
+    if (videoMode === 'file' && videoRef.current) {
+      videoRef.current.pause();
+      videoRef.current.currentTime = 0;
+    }
     setPhase('setup');
-    if (analyzerRef.current) {
-      analyzerRef.current.reset();
-    }
-    setCycleCount(0);
   };
+
+  const sourceLabel =
+    videoMode === 'webcam'
+      ? 'Webcam'
+      : videoFile
+      ? videoFile.name
+      : 'Keine Datei';
 
   return (
     <div className="space-y-4">
@@ -434,12 +493,29 @@ export function AnalysisView({
           className="w-full h-auto rounded-lg shadow-2xl border-2 border-gray-700"
         />
 
-        <div className="absolute top-4 left-4 right-4 flex justify-between items-start">
-          {phase === 'recording' && (
+        {phase === 'countdown' && (
+          <div className="absolute inset-0 flex flex-col items-center justify-center bg-black/70 rounded-lg">
+            <div className="text-9xl font-black text-yellow-400 tabular-nums drop-shadow-[0_0_20px_rgba(0,0,0,0.8)]">
+              {countdown}
+            </div>
+            <div className="mt-4 text-2xl text-white font-semibold">
+              Auf Position gehen
+            </div>
+            <button
+              onClick={() => setPhase('setup')}
+              className="mt-6 py-2 px-6 rounded-lg bg-gray-700/80 hover:bg-gray-600 text-gray-200"
+            >
+              Abbrechen
+            </button>
+          </div>
+        )}
+
+        {phase === 'recording' && (
+          <div className="absolute top-4 left-4 right-4 flex justify-between items-start pointer-events-none">
             <div className="bg-black/80 backdrop-blur-sm rounded-lg px-4 py-3">
-              <div className="text-sm text-gray-400 mb-1">Aufnahme läuft</div>
+              <div className="text-sm text-gray-400 mb-1">Aufnahme</div>
               <div className="flex items-center gap-3">
-                <div className="text-2xl font-bold text-green-400">
+                <div className="text-3xl font-bold text-green-400 tabular-nums">
                   {cycleCount} / {targetCycles}
                 </div>
                 <div className="text-sm text-gray-400">Zyklen</div>
@@ -447,30 +523,44 @@ export function AnalysisView({
               <div className="mt-2 h-2 bg-gray-700 rounded-full overflow-hidden w-48">
                 <div
                   className="h-full bg-green-400 transition-all duration-300"
-                  style={{ width: `${(cycleCount / targetCycles) * 100}%` }}
+                  style={{
+                    width: `${(cycleCount / targetCycles) * 100}%`,
+                  }}
                 />
               </div>
-            </div>
-          )}
-
-          <div className="bg-black/80 backdrop-blur-sm rounded-lg px-4 py-3">
-            <div className="text-sm text-gray-400 mb-1">Pose-Qualität</div>
-            <div className="flex items-center gap-2">
-              <div
-                className={`w-3 h-3 rounded-full ${
-                  poseConfidence > 0.7
-                    ? 'bg-green-400'
-                    : poseConfidence > 0.5
-                    ? 'bg-yellow-400'
-                    : 'bg-red-400'
-                }`}
-              />
-              <span className="font-mono text-lg">
-                {(poseConfidence * 100).toFixed(0)}%
-              </span>
+              <div className="mt-2 text-xs text-gray-300">
+                Seite:{' '}
+                <span className="font-semibold text-yellow-300">
+                  {lockedSide === 'right' ? 'rechts' : 'links'}
+                </span>
+              </div>
+              <div className="text-xs text-gray-300">
+                Status:{' '}
+                <span
+                  className={
+                    cyclePhase === 'searching'
+                      ? 'text-yellow-300'
+                      : 'text-green-300'
+                  }
+                >
+                  {cyclePhase === 'searching'
+                    ? 'Warte auf Bewegung'
+                    : cyclePhase === 'extension'
+                    ? 'Streckung'
+                    : 'Beugung'}
+                </span>
+              </div>
+              <div className="text-xs text-gray-300">
+                Knie:{' '}
+                <span className="font-mono text-green-300">
+                  {currentAngles.knee !== null
+                    ? `${currentAngles.knee.toFixed(0)}°`
+                    : '--'}
+                </span>
+              </div>
             </div>
           </div>
-        </div>
+        )}
 
         {!isDetectorReady && (
           <div className="absolute inset-0 flex items-center justify-center bg-black/70 rounded-lg">
@@ -480,77 +570,100 @@ export function AnalysisView({
             </div>
           </div>
         )}
+
+        {sourceState.error && (
+          <div className="absolute inset-0 flex items-center justify-center bg-red-900/80 rounded-lg">
+            <div className="text-white font-semibold p-6">
+              Video-Quelle: {sourceState.error}
+            </div>
+          </div>
+        )}
       </div>
 
-      {phase === 'recording' && (
-        <div className="grid grid-cols-5 gap-2 max-w-4xl mx-auto">
-          <AngleDisplay label="Knie" value={currentAngles.knee} />
-          <AngleDisplay label="Hüfte" value={currentAngles.hip} />
-          <AngleDisplay label="Rücken" value={currentAngles.back} />
-          <AngleDisplay label="Ellbogen" value={currentAngles.elbow} />
-          <AngleDisplay label="Knöchel" value={currentAngles.ankle} />
-        </div>
-      )}
-
       {phase === 'setup' && (
-        <div className="max-w-4xl mx-auto bg-gray-800/50 rounded-lg p-6 border border-gray-700">
-          <h3 className="font-semibold text-green-400 mb-4 text-lg">
-            Vorbereitung
-          </h3>
-          <div className="grid md:grid-cols-2 gap-6">
-            <div>
-              <h4 className="font-medium text-white mb-2">Kamera-Position</h4>
-              <ul className="text-sm text-gray-400 space-y-2">
-                <li className="flex items-start gap-2">
-                  <span className="text-green-400">1.</span>
-                  <span>Positioniere die Kamera seitlich zum Fahrrad</span>
-                </li>
-                <li className="flex items-start gap-2">
-                  <span className="text-green-400">2.</span>
-                  <span>Kamera auf Höhe des Tretlagers ausrichten</span>
-                </li>
-                <li className="flex items-start gap-2">
-                  <span className="text-green-400">3.</span>
-                  <span>Abstand: 2-3 Meter für beste Ergebnisse</span>
-                </li>
-              </ul>
-            </div>
-            <div>
-              <h4 className="font-medium text-white mb-2">Körper-Position</h4>
-              <ul className="text-sm text-gray-400 space-y-2">
-                <li className="flex items-start gap-2">
-                  <span className="text-green-400">1.</span>
-                  <span>
-                    Schulter, Hüfte, Knie und Knöchel müssen sichtbar sein
-                  </span>
-                </li>
-                <li className="flex items-start gap-2">
-                  <span className="text-green-400">2.</span>
-                  <span>Tritt gleichmäßig mit normaler Kadenz</span>
-                </li>
-                <li className="flex items-start gap-2">
-                  <span className="text-green-400">3.</span>
-                  <span>Vermeide Bewegungen außerhalb der Pedaldrehung</span>
-                </li>
-              </ul>
+        <div className="max-w-4xl mx-auto bg-gray-800/50 rounded-lg p-6 border border-gray-700 space-y-5">
+          <div>
+            <h3 className="text-lg font-semibold text-green-400 mb-3">
+              Sichtbarkeit (Live)
+            </h3>
+            <div className="grid grid-cols-2 gap-4">
+              <SideScorePanel
+                title="Links"
+                scores={kpScores.left}
+                isHighlighted={
+                  forcedSide
+                    ? forcedSide === 'left'
+                    : recommendedSide === 'left'
+                }
+                label={
+                  forcedSide === 'left'
+                    ? 'fixiert'
+                    : recommendedSide === 'left' && !forcedSide
+                    ? 'auto'
+                    : null
+                }
+              />
+              <SideScorePanel
+                title="Rechts"
+                scores={kpScores.right}
+                isHighlighted={
+                  forcedSide
+                    ? forcedSide === 'right'
+                    : recommendedSide === 'right'
+                }
+                label={
+                  forcedSide === 'right'
+                    ? 'fixiert'
+                    : recommendedSide === 'right' && !forcedSide
+                    ? 'auto'
+                    : null
+                }
+              />
             </div>
           </div>
 
-          <div className="mt-6 flex flex-col sm:flex-row gap-3">
+          <div className="border-t border-gray-700 pt-3 text-sm text-gray-400 grid grid-cols-2 gap-x-4">
+            <div>
+              Quelle:{' '}
+              <span className="text-gray-200 font-mono">{sourceLabel}</span>
+            </div>
+            <div>
+              Seite:{' '}
+              <span className="text-yellow-300 font-semibold">
+                {forcedSide
+                  ? forcedSide === 'right'
+                    ? 'rechts (fix)'
+                    : 'links (fix)'
+                  : recommendedSide === 'right'
+                  ? 'rechts (auto)'
+                  : 'links (auto)'}
+              </span>
+            </div>
+          </div>
+
+          <div className="flex flex-col sm:flex-row gap-3">
             <button
-              onClick={handleStartAnalysis}
-              disabled={!isDetectorReady || poseConfidence < 0.3}
-              className={`flex-1 py-3 px-6 rounded-lg font-semibold transition-all ${
-                isDetectorReady && poseConfidence >= 0.3
+              onClick={handleStart}
+              disabled={
+                !isDetectorReady ||
+                (videoMode === 'file' && !videoFile) ||
+                !sourceState.isReady
+              }
+              className={`flex-1 py-4 px-6 rounded-lg font-bold text-xl transition-all ${
+                isDetectorReady &&
+                sourceState.isReady &&
+                (videoMode === 'webcam' || videoFile)
                   ? 'bg-green-500 hover:bg-green-600 text-white'
                   : 'bg-gray-600 text-gray-400 cursor-not-allowed'
               }`}
             >
-              {poseConfidence < 0.3 ? 'Pose nicht erkannt' : 'Analyse starten'}
+              {videoMode === 'file' && skipCountdownInFileMode
+                ? 'Replay starten'
+                : `Aufnahme in ${COUNTDOWN_SECONDS}s`}
             </button>
             <button
               onClick={onCancel}
-              className="py-3 px-6 rounded-lg font-semibold bg-gray-700 hover:bg-gray-600 text-gray-300 transition-all"
+              className="py-4 px-6 rounded-lg font-semibold bg-gray-700 hover:bg-gray-600 text-gray-300"
             >
               Abbrechen
             </button>
@@ -561,8 +674,8 @@ export function AnalysisView({
       {phase === 'recording' && (
         <div className="max-w-4xl mx-auto flex justify-center">
           <button
-            onClick={handleStopAnalysis}
-            className="py-3 px-8 rounded-lg font-semibold bg-red-500 hover:bg-red-600 text-white transition-all"
+            onClick={handleStop}
+            className="py-3 px-8 rounded-lg font-semibold bg-red-500 hover:bg-red-600 text-white"
           >
             Aufnahme abbrechen
           </button>
@@ -572,21 +685,61 @@ export function AnalysisView({
   );
 }
 
-interface AngleDisplayProps {
-  label: string;
-  value: number | null;
+interface SideScorePanelProps {
+  title: string;
+  scores: { hip: number; knee: number; ankle: number };
+  isHighlighted: boolean;
+  label: string | null;
 }
 
-function AngleDisplay({ label, value }: AngleDisplayProps) {
+function SideScorePanel({
+  title,
+  scores,
+  isHighlighted,
+  label,
+}: SideScorePanelProps) {
   return (
-    <div className="bg-gray-800/80 rounded-lg p-3 text-center">
-      <div className="text-xs text-gray-400 mb-1">{label}</div>
-      <div
-        className="text-lg font-mono font-bold"
-        style={{ color: value !== null ? getAngleColor(value) : '#6b7280' }}
-      >
-        {value !== null ? `${value.toFixed(0)}°` : '--'}
+    <div
+      className={`rounded-lg p-3 border-2 ${
+        isHighlighted
+          ? 'border-yellow-400 bg-yellow-900/20'
+          : 'border-gray-700 bg-gray-900/40'
+      }`}
+    >
+      <div className="flex items-baseline justify-between mb-2">
+        <span className="text-base font-bold text-gray-200">{title}</span>
+        {label && (
+          <span className="text-xs text-yellow-300 font-semibold">
+            ★ {label}
+          </span>
+        )}
       </div>
+      <ScoreRow label="Hüfte" value={scores.hip} />
+      <ScoreRow label="Knie" value={scores.knee} />
+      <ScoreRow label="Knöchel" value={scores.ankle} />
+    </div>
+  );
+}
+
+function ScoreRow({ label, value }: { label: string; value: number }) {
+  const pct = Math.round(value * 100);
+  const color =
+    value >= 0.5 ? '#22c55e' : value >= 0.2 ? '#eab308' : '#ef4444';
+  return (
+    <div className="flex items-center gap-2 py-1">
+      <span className="text-sm text-gray-400 w-20">{label}</span>
+      <div className="flex-1 h-2 bg-gray-800 rounded-full overflow-hidden">
+        <div
+          className="h-full transition-all duration-200"
+          style={{ width: `${pct}%`, backgroundColor: color }}
+        />
+      </div>
+      <span
+        className="text-sm font-mono font-bold tabular-nums w-10 text-right"
+        style={{ color }}
+      >
+        {pct}
+      </span>
     </div>
   );
 }
