@@ -8,7 +8,7 @@ export const TFLITE_MODEL_URLS: Record<QuantizationLevel, string> = {
   int8: "/models/movenet-lightning-int8.tflite",
 };
 
-export const WARMUP_FRAMES = 30;
+export const WARMUP_FRAMES = 5;
 export const MODEL_INPUT_SIZE = 192;
 
 // Keypoint-Indizes MoveNet (identisch zu bisherigem Stack)
