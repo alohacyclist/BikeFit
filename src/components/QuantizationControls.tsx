@@ -1,4 +1,4 @@
-import { QuantizationLevel } from "../types/quantization";
+import { QuantizationLevel, WARMUP_FRAMES } from "../types/quantization";
 import type { BodySide } from "../utils/AngleCalculator";
 import type { ThreadingPreference } from "../hooks/usePoseDetection";
 
@@ -168,7 +168,7 @@ export function QuantizationControls({
         <div className="flex items-center gap-2 bg-yellow-900/40 border border-yellow-700/50 rounded-md px-3 py-2">
           <span className="w-2 h-2 rounded-full bg-yellow-400 animate-pulse" />
           <span className="text-xs text-yellow-300">
-            Aufwärmen... (30 Frames Warmup)
+            Aufwärmen... ({WARMUP_FRAMES} Frames Warmup)
           </span>
         </div>
       )}
