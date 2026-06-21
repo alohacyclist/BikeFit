@@ -79,7 +79,10 @@ export interface UsePoseDetectionResult {
   metrics: PoseMetrics;
   isLoading: boolean;
   error: string | null;
-  detectPose: (video: HTMLVideoElement) => Promise<Pose | null>;
+  detectPose: (
+    video: HTMLVideoElement,
+    opts?: { record?: boolean },
+  ) => Promise<Pose | null>;
   loadModel: (level: QuantizationLevel) => Promise<void>;
   resetBackend: () => Promise<void>;
   /** Startet das Warmup-Fenster für die kommende Aufnahme neu. */
@@ -171,12 +174,18 @@ export function usePoseDetection(
    * vor der Aufnahme, und kein aufgezeichneter Frame trägt das Flag.
    * Setzt zugleich Frame-Zähler und FPS-Fenster zurück, damit frameIndex
    * und fps pro Aufnahme sauber bei null beginnen.
+   *
+   * Bewusst KEIN setIsWarmingUp(true): der UI-"Bereit/Warmup"-State gehört
+   * loadModel (Modell-Aufwärmen). Würde beginWarmup ihn auf true setzen,
+   * bliebe er nach der Aufnahme hängen (nur loadModel setzt ihn false) und
+   * würde Export + Stufen-/Seiten-/Threading-Controls dauerhaft sperren.
+   * Das Per-Frame-isWarmup-Flag (warmupCounterRef) markiert die Frames im
+   * Export unabhängig vom UI-State.
    */
   const beginWarmup = useCallback(() => {
     warmupCounterRef.current = 0;
     frameCountRef.current = 0;
     frameTimestamps.current = [];
-    setIsWarmingUp(true);
   }, []);
 
   // Modell laden (auch bei Level-Wechsel aufrufbar)
@@ -340,11 +349,15 @@ export function usePoseDetection(
    * Disposed inputTensor & outputTensor sauber pro Frame (Memory-Leak-Schutz).
    */
   const detectPose = useCallback(
-    async (video: HTMLVideoElement): Promise<Pose | null> => {
+    async (
+      video: HTMLVideoElement,
+      opts?: { record?: boolean },
+    ): Promise<Pose | null> => {
       if (!detector || video.readyState < 2) {
         return null;
       }
 
+      const record = opts?.record ?? true;
       const level = levelRef.current;
       let outputTensor: tf.Tensor | null = null;
 
@@ -393,9 +406,16 @@ export function usePoseDetection(
         outputTensor = null;
 
         const pose: Pose = { keypoints };
+        setPoses([pose]);
 
-        // Per-Frame Warmup-Flag — markiert die ersten WARMUP_FRAMES realen
-        // Inferenzen für das Postprocessing-Filter in Python.
+        // Setup-Preview (record=false) darf die Messzähler NICHT verbrauchen —
+        // sonst stiehlt eine Preview-Inferenz Warmup-/Frame-Budget der Aufnahme.
+        if (!record) {
+          return pose;
+        }
+
+        // Per-Frame Warmup-Flag — markiert die ersten WARMUP_FRAMES Inferenzen
+        // der Aufnahme für das Postprocessing-Filter in Python.
         // UI-State (isWarmingUp) wird NICHT mehr hier gesetzt — siehe loadModel.
         warmupCounterRef.current += 1;
         const inWarmup = warmupCounterRef.current <= WARMUP_FRAMES;
@@ -422,7 +442,6 @@ export function usePoseDetection(
           isWarmup: inWarmup,
         };
 
-        setPoses([pose]);
         // Inferenzzeit erst nach Warmup in State schreiben
         if (!inWarmup) {
           setMetrics({

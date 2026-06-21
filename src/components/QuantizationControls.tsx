@@ -1,6 +1,6 @@
-import { QuantizationLevel } from '../types/quantization';
-import type { BodySide } from '../utils/AngleCalculator';
-import type { ThreadingPreference } from '../hooks/usePoseDetection';
+import { QuantizationLevel } from "../types/quantization";
+import type { BodySide } from "../utils/AngleCalculator";
+import type { ThreadingPreference } from "../hooks/usePoseDetection";
 
 interface QuantizationControlsProps {
   currentLevel: QuantizationLevel;
@@ -19,11 +19,13 @@ interface QuantizationControlsProps {
   threadingPreference: ThreadingPreference;
   onThreadingPreferenceChange: (mode: ThreadingPreference) => void;
   multiThreadingAvailable: boolean;
-  activeThreadingMode: 'single' | 'multi' | 'unknown';
+  activeThreadingMode: "single" | "multi" | "unknown";
+  /** Während laufender Aufnahme: Stufe/Seite/Threading dürfen nicht wechseln. */
+  recording?: boolean;
 }
 
-const LEVELS: QuantizationLevel[] = ['fp32', 'fp16', 'int8'];
-const SIDES: BodySide[] = ['left', 'right'];
+const LEVELS: QuantizationLevel[] = ["fp32", "fp16", "int8"];
+const SIDES: BodySide[] = ["left", "right"];
 
 export function QuantizationControls({
   currentLevel,
@@ -39,8 +41,9 @@ export function QuantizationControls({
   onThreadingPreferenceChange,
   multiThreadingAvailable,
   activeThreadingMode,
+  recording = false,
 }: QuantizationControlsProps) {
-  const disabled = isLoading || isWarmingUp;
+  const disabled = isLoading || isWarmingUp || recording;
 
   return (
     <div className="bg-gray-800/60 rounded-lg p-4 border border-gray-700 space-y-4">
@@ -59,9 +62,9 @@ export function QuantizationControls({
                 disabled={disabled}
                 className={`py-2 px-3 rounded-md text-sm font-mono uppercase transition-colors ${
                   active
-                    ? 'bg-blue-600 text-white border border-blue-400'
-                    : 'bg-gray-700 text-gray-300 border border-gray-600 hover:bg-gray-600'
-                } ${disabled ? 'opacity-50 cursor-not-allowed' : ''}`}
+                    ? "bg-blue-600 text-white border border-blue-400"
+                    : "bg-gray-700 text-gray-300 border border-gray-600 hover:bg-gray-600"
+                } ${disabled ? "opacity-50 cursor-not-allowed" : ""}`}
               >
                 {level}
               </button>
@@ -85,18 +88,18 @@ export function QuantizationControls({
                 disabled={disabled}
                 className={`py-2 px-3 rounded-md text-sm font-semibold transition-colors ${
                   active
-                    ? 'bg-yellow-500 text-black border border-yellow-300'
-                    : 'bg-gray-700 text-gray-300 border border-gray-600 hover:bg-gray-600'
-                } ${disabled ? 'opacity-50 cursor-not-allowed' : ''}`}
+                    ? "bg-yellow-500 text-black border border-yellow-300"
+                    : "bg-gray-700 text-gray-300 border border-gray-600 hover:bg-gray-600"
+                } ${disabled ? "opacity-50 cursor-not-allowed" : ""}`}
               >
-                {side === 'left' ? 'Links' : 'Rechts'}
+                {side === "left" ? "Links" : "Rechts"}
               </button>
             );
           })}
         </div>
         <p className="text-xs text-gray-500 mt-1">
-          Muss mit der Seite übereinstimmen, die in der GT-Software
-          ausgewertet wird.
+          Muss mit der Seite übereinstimmen, die in der GT-Software ausgewertet
+          wird.
         </p>
       </div>
 
@@ -107,27 +110,27 @@ export function QuantizationControls({
         </h3>
         <div className="grid grid-cols-2 gap-2">
           <button
-            onClick={() => onThreadingPreferenceChange('single')}
+            onClick={() => onThreadingPreferenceChange("single")}
             disabled={disabled}
             className={`py-2 px-3 rounded-md text-sm font-semibold transition-colors ${
-              threadingPreference === 'single'
-                ? 'bg-purple-600 text-white border border-purple-400'
-                : 'bg-gray-700 text-gray-300 border border-gray-600 hover:bg-gray-600'
-            } ${disabled ? 'opacity-50 cursor-not-allowed' : ''}`}
+              threadingPreference === "single"
+                ? "bg-purple-600 text-white border border-purple-400"
+                : "bg-gray-700 text-gray-300 border border-gray-600 hover:bg-gray-600"
+            } ${disabled ? "opacity-50 cursor-not-allowed" : ""}`}
           >
             Single
           </button>
           <button
-            onClick={() => onThreadingPreferenceChange('multi')}
+            onClick={() => onThreadingPreferenceChange("multi")}
             disabled={disabled || !multiThreadingAvailable}
             className={`py-2 px-3 rounded-md text-sm font-semibold transition-colors ${
-              threadingPreference === 'multi'
-                ? 'bg-purple-600 text-white border border-purple-400'
-                : 'bg-gray-700 text-gray-300 border border-gray-600 hover:bg-gray-600'
+              threadingPreference === "multi"
+                ? "bg-purple-600 text-white border border-purple-400"
+                : "bg-gray-700 text-gray-300 border border-gray-600 hover:bg-gray-600"
             } ${
               disabled || !multiThreadingAvailable
-                ? 'opacity-50 cursor-not-allowed'
-                : ''
+                ? "opacity-50 cursor-not-allowed"
+                : ""
             }`}
           >
             Multi
@@ -136,13 +139,12 @@ export function QuantizationControls({
         <p className="text-xs text-gray-500 mt-1">
           {!multiThreadingAvailable && (
             <>
-              Multi-Threading nicht verfügbar (SharedArrayBuffer fehlt — COOP/COEP-Header nicht gesetzt).{' '}
+              Multi-Threading nicht verfügbar (SharedArrayBuffer fehlt —
+              COOP/COEP-Header nicht gesetzt).{" "}
             </>
           )}
-          Aktiv:{' '}
-          <span className="font-mono text-gray-300">
-            {activeThreadingMode}
-          </span>
+          Aktiv:{" "}
+          <span className="font-mono text-gray-300">{activeThreadingMode}</span>
           . Änderung wirkt nach Reload des Modells.
         </p>
       </div>
@@ -157,7 +159,8 @@ export function QuantizationControls({
           value={participantId}
           onChange={(e) => onParticipantIdChange(e.target.value)}
           placeholder="P01"
-          className="w-full px-3 py-2 rounded-md bg-gray-900 border border-gray-700 text-sm text-gray-200 font-mono focus:outline-none focus:border-blue-500"
+          disabled={disabled}
+          className="w-full px-3 py-2 rounded-md bg-gray-900 border border-gray-700 text-sm text-gray-200 font-mono focus:outline-none focus:border-blue-500 disabled:opacity-50"
         />
       </div>
 
@@ -176,11 +179,11 @@ export function QuantizationControls({
 
       <button
         onClick={onExport}
-        disabled={isWarmingUp}
+        disabled={isWarmingUp || recording}
         className={`w-full py-2 px-3 rounded-md text-sm font-semibold transition-colors ${
-          isWarmingUp
-            ? 'bg-gray-700 text-gray-500 cursor-not-allowed'
-            : 'bg-green-600 hover:bg-green-700 text-white'
+          isWarmingUp || recording
+            ? "bg-gray-700 text-gray-500 cursor-not-allowed"
+            : "bg-green-600 hover:bg-green-700 text-white"
         }`}
       >
         JSON exportieren

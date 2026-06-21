@@ -48,8 +48,10 @@ export interface BenchmarkSession {
   threadingMode: "single" | "multi" | "unknown";
   /** Tatsächlich an TFLite übergebener numThreads-Parameter. */
   numThreads: number | null;
-  videoSource: "webcam" | "file";
+  videoSource: "file";
   videoSourceName?: string;
+  /** Ziel-Framerate des deterministischen Replay-Steppings (CFR-Annahme). */
+  targetFps: number;
   frames: FrameMeasurement[];
   validationMetrics?: ValidationMetrics;
 }
@@ -124,7 +126,8 @@ export class BenchmarkExporter {
       modelFingerprint: null,
       threadingMode: "unknown",
       numThreads: null,
-      videoSource: "webcam",
+      videoSource: "file",
+      targetFps: 0,
       frames: [],
     };
   }
@@ -149,10 +152,10 @@ export class BenchmarkExporter {
     this.session.threadingMode = mode;
   }
 
-  setVideoSource(source: "webcam" | "file", name?: string): void {
+  setVideoSource(name: string | undefined, targetFps: number): void {
     if (!this.session) return;
-    this.session.videoSource = source;
     this.session.videoSourceName = name;
+    this.session.targetFps = targetFps;
   }
 
   recordFrame(measurement: FrameMeasurement): void {
