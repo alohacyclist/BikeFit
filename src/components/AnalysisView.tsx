@@ -45,6 +45,8 @@ interface AnalysisViewProps {
   onRecordingFinalize?: (
     interpolatedFrames: number,
     cyclesDetected: number,
+    durationSeconds: number,
+    expectedFrames: number,
   ) => void;
   /** Bei Aufnahmestart aufgerufen — z.B. um das Warmup-Fenster zu starten. */
   onRecordingStart?: () => void;
@@ -388,6 +390,8 @@ export function AnalysisView({
         onRecordingFinalize?.(
           analyzer.getInterpolatedFramesCount(),
           analyzer.getCycleCount(),
+          dur,
+          total,
         );
         if (results) onComplete(results);
       }
@@ -542,6 +546,14 @@ export function AnalysisView({
                 {sourceState.totalFrames ?? "–"}
               </span>{" "}
               @ {targetFps} fps
+            </div>
+            <div>
+              Länge:{" "}
+              <span className="text-gray-200 font-mono">
+                {sourceState.durationSeconds > 0
+                  ? `${sourceState.durationSeconds.toFixed(1)} s`
+                  : "–"}
+              </span>
             </div>
           </div>
 
