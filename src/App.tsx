@@ -98,7 +98,13 @@ function App() {
   }, []);
 
   const handleRecordingFinalize = useCallback(
-    (interpolated: number, cycles: number) => {
+    (
+      interpolated: number,
+      cycles: number,
+      durationSeconds: number,
+      expectedFrames: number,
+    ) => {
+      benchmarkExporter.setVideoMeta(durationSeconds, expectedFrames);
       benchmarkExporter.finalizeMetrics(interpolated, cycles);
       setLastSummary({ interpolated, cycles });
     },

@@ -52,6 +52,10 @@ export interface BenchmarkSession {
   videoSourceName?: string;
   /** Ziel-Framerate des deterministischen Replay-Steppings (CFR-Annahme). */
   targetFps: number;
+  /** Länge des Quell-Videos in Sekunden (0 bis Aufnahme finalisiert). */
+  durationSeconds: number;
+  /** Erwartete Frame-Anzahl = floor(durationSeconds * targetFps). */
+  expectedFrames: number;
   frames: FrameMeasurement[];
   validationMetrics?: ValidationMetrics;
 }
@@ -128,6 +132,8 @@ export class BenchmarkExporter {
       numThreads: null,
       videoSource: "file",
       targetFps: 0,
+      durationSeconds: 0,
+      expectedFrames: 0,
       frames: [],
     };
   }
@@ -156,6 +162,13 @@ export class BenchmarkExporter {
     if (!this.session) return;
     this.session.videoSourceName = name;
     this.session.targetFps = targetFps;
+  }
+
+  /** Beim Finalisieren gesetzt — Videolänge + erwartete Frame-Anzahl. */
+  setVideoMeta(durationSeconds: number, expectedFrames: number): void {
+    if (!this.session) return;
+    this.session.durationSeconds = durationSeconds;
+    this.session.expectedFrames = expectedFrames;
   }
 
   recordFrame(measurement: FrameMeasurement): void {
