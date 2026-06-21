@@ -7,7 +7,6 @@ import { AnalysisResults } from "./services/BiomechanicalAnalyzer";
 import { benchmarkExporter } from "./services/BenchmarkExporter";
 import { calculateKneeAngle, type BodySide } from "./utils/AngleCalculator";
 import { KP, type QuantizationLevel } from "./types/quantization";
-import type { VideoSourceMode } from "./hooks/useVideoSource";
 
 function App() {
   const {
@@ -31,9 +30,10 @@ function App() {
   } = usePoseDetection("fp32");
 
   const [participantId, setParticipantId] = useState("P01");
-  const [videoMode, setVideoMode] = useState<VideoSourceMode>("webcam");
   const [videoFile, setVideoFile] = useState<File | null>(null);
+  const [targetFps, setTargetFps] = useState(30);
   const [forcedSide, setForcedSide] = useState<BodySide>("right");
+  const [isRecording, setIsRecording] = useState(false);
   const [analysisResults, setAnalysisResults] =
     useState<AnalysisResults | null>(null);
   const [lastSummary, setLastSummary] = useState<{
@@ -50,7 +50,7 @@ function App() {
     benchmarkExporter.setModelFingerprint(modelFingerprint);
     benchmarkExporter.setThreadingMode(activeThreadingMode);
     benchmarkExporter.setNumThreads(activeNumThreads);
-    benchmarkExporter.setVideoSource(videoMode, videoFile?.name);
+    benchmarkExporter.setVideoSource(videoFile?.name, targetFps);
   }, [
     detector,
     currentLevel,
@@ -59,7 +59,7 @@ function App() {
     modelFingerprint,
     activeThreadingMode,
     activeNumThreads,
-    videoMode,
+    targetFps,
     videoFile,
   ]);
 
@@ -148,7 +148,7 @@ function App() {
     benchmarkExporter.setModelFingerprint(modelFingerprint);
     benchmarkExporter.setThreadingMode(activeThreadingMode);
     benchmarkExporter.setNumThreads(activeNumThreads);
-    benchmarkExporter.setVideoSource(videoMode, videoFile?.name);
+    benchmarkExporter.setVideoSource(videoFile?.name, targetFps);
   }, [
     participantId,
     currentLevel,
@@ -156,7 +156,7 @@ function App() {
     modelFingerprint,
     activeThreadingMode,
     activeNumThreads,
-    videoMode,
+    targetFps,
     videoFile,
   ]);
 
@@ -208,23 +208,24 @@ function App() {
             isDetectorReady={!isLoading && detector !== null}
             onComplete={handleAnalysisComplete}
             onCancel={handleResetSession}
-            targetCycles={5}
             onFrameMeasurement={handleFrameMeasurement}
             onSideLocked={handleSideLocked}
             onRecordingFinalize={handleRecordingFinalize}
             onRecordingStart={beginWarmup}
-            videoMode={videoMode}
+            onRecordingActiveChange={setIsRecording}
+            onRecordingAbort={handleResetSession}
             videoFile={videoFile}
             forcedSide={forcedSide}
+            targetFps={targetFps}
           />
 
           <div className="space-y-4">
             <VideoSourcePanel
-              mode={videoMode}
-              onModeChange={setVideoMode}
               file={videoFile}
               onFileChange={setVideoFile}
-              participantId={participantId}
+              targetFps={targetFps}
+              onTargetFpsChange={setTargetFps}
+              disabled={isRecording}
             />
 
             <QuantizationControls
@@ -241,6 +242,7 @@ function App() {
               onThreadingPreferenceChange={handleThreadingChange}
               multiThreadingAvailable={multiThreadingAvailable}
               activeThreadingMode={activeThreadingMode}
+              recording={isRecording}
             />
 
             <div className="bg-gray-800/50 rounded-lg p-4 border border-gray-700 text-xs space-y-1">
