@@ -60,18 +60,6 @@ export interface BenchmarkSession {
   validationMetrics?: ValidationMetrics;
 }
 
-export interface BenchmarkSummary {
-  totalFrames: number;
-  validFrames: number;
-  meanInferenceMs: number;
-  stdInferenceMs: number;
-  p50Ms: number;
-  p95Ms: number;
-  meanFps: number;
-  meanKneeAngleRight: number | null;
-  meanKneeAngleLeft: number | null;
-}
-
 import { WARMUP_FRAMES } from "../types/quantization";
 
 function collectSystemInfo(): SystemInfo {
@@ -87,33 +75,6 @@ function collectSystemInfo(): SystemInfo {
     crossOriginIsolated: coi,
     sharedArrayBufferAvailable: typeof SharedArrayBuffer !== "undefined",
   };
-}
-
-function percentile(sorted: number[], p: number): number {
-  if (sorted.length === 0) return 0;
-  const idx = Math.min(
-    sorted.length - 1,
-    Math.max(0, Math.floor((p / 100) * sorted.length)),
-  );
-  return sorted[idx];
-}
-
-function mean(values: number[]): number {
-  if (values.length === 0) return 0;
-  return values.reduce((a, b) => a + b, 0) / values.length;
-}
-
-function std(values: number[], avg: number): number {
-  if (values.length === 0) return 0;
-  const variance =
-    values.reduce((acc, v) => acc + (v - avg) * (v - avg), 0) / values.length;
-  return Math.sqrt(variance);
-}
-
-function meanOrNull(values: Array<number | null>): number | null {
-  const filtered = values.filter((v): v is number => v !== null);
-  if (filtered.length === 0) return null;
-  return mean(filtered);
 }
 
 export class BenchmarkExporter {
@@ -259,45 +220,6 @@ export class BenchmarkExporter {
     a.click();
     document.body.removeChild(a);
     URL.revokeObjectURL(url);
-  }
-
-  getSummary(): BenchmarkSummary {
-    const empty: BenchmarkSummary = {
-      totalFrames: 0,
-      validFrames: 0,
-      meanInferenceMs: 0,
-      stdInferenceMs: 0,
-      p50Ms: 0,
-      p95Ms: 0,
-      meanFps: 0,
-      meanKneeAngleRight: null,
-      meanKneeAngleLeft: null,
-    };
-
-    if (!this.session) return empty;
-
-    const all = this.session.frames;
-    const valid = all.filter((f) => !f.isWarmup);
-
-    if (valid.length === 0) {
-      return { ...empty, totalFrames: all.length };
-    }
-
-    const inferenceTimes = valid.map((f) => f.inferenceMs);
-    const sorted = [...inferenceTimes].sort((a, b) => a - b);
-    const meanInf = mean(inferenceTimes);
-
-    return {
-      totalFrames: all.length,
-      validFrames: valid.length,
-      meanInferenceMs: meanInf,
-      stdInferenceMs: std(inferenceTimes, meanInf),
-      p50Ms: percentile(sorted, 50),
-      p95Ms: percentile(sorted, 95),
-      meanFps: mean(valid.map((f) => f.fps)),
-      meanKneeAngleRight: meanOrNull(valid.map((f) => f.kneeAngleRight)),
-      meanKneeAngleLeft: meanOrNull(valid.map((f) => f.kneeAngleLeft)),
-    };
   }
 
   reset(): void {
