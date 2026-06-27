@@ -28,15 +28,19 @@ ROHFORMAT (eine Session = eine Quantisierungsstufe, ein Video, ein Durchlauf):
           "timestampMs": float,         # performance.now() bei Aufzeichnung
           "inferenceMs": float,         # NUR Modell-Forward-Pass + GPU/WASM-Sync
           "fps": float,                 # per-Frame gleitender Wall-Clock-Durchsatz
-          "kneeAngleRight": float | null,
-          "kneeAngleLeft": float | null,
+          "kneeAngleRight": float,      # immer berechnet (kein App-Filter)
+          "kneeAngleLeft": float,       # immer berechnet (kein App-Filter)
           "keypointScores": [float x 17],
           "isWarmup": bool              # true => aus Statistik ausschließen
         },
         ...
-      ],
-      "validationMetrics": { ... } | undefined
+      ]
     }
+
+Confidence-Filterung (Selektion gültiger Frames) erfolgt AUSSCHLIESSLICH hier
+im Postprocessing — anhand keypointScores und einer dokumentierten Schwelle
+(Default 0.2, per CLI variierbar für Sensitivity-Sweep). Damit kann auf
+identischen Roh-Frames mit verschiedenen Schwellen reproduziert werden.
 
 Statistik wird ausschließlich über NON-WARMUP-Frames (isWarmup == false) gebildet
 — identisch zur (entfernten) In-App-Methode getSummary, mit EINER Anpassung:

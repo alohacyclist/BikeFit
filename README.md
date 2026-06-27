@@ -88,14 +88,14 @@ BenchmarkSession {
   warmupFrames, lockedSide,
   modelFingerprint, threadingMode, numThreads,
   videoSource: 'file', videoSourceName, targetFps,
-  frames: FrameMeasurement[],
-  validationMetrics: {
-    validKneeRatio{Right,Left,Selected},
-    meanKeypointScores: number[17],
-    interpolatedFrames, totalCyclesDetected
-  }
+  durationSeconds, expectedFrames,
+  frames: FrameMeasurement[]
 }
 ```
+
+App rechnet keine Aggregate. Selektion gültiger Frames (anhand `keypointScores`)
++ jede statistische Auswertung erfolgt im Python-Postprocessing mit dokumentierter,
+variierbarer Confidence-Schwelle.
 
 ## Inferenz-Pipeline
 
@@ -193,8 +193,7 @@ Im exportierten JSON:
 | `systemInfo.crossOriginIsolated` | Browser-bestätigte COI — ohne diese kein echtes MT möglich |
 | `targetFps` | CFR-Framerate für deterministisches Stepping |
 | `lockedSide` | fix gewählte Körperseite (muss mit GT übereinstimmen) |
-| `validationMetrics.validKneeRatio*` | Anteil Frames mit gültigem Kniewinkel (Survivorship-Diagnose) |
-| `validationMetrics.interpolatedFrames` | Anzahl per Hold-Last-Value überbrückter Frames |
+| `frames[i].keypointScores[17]` | Roh-Confidence pro Keypoint — Selektion gültiger Frames erfolgt in Python (variierbare Schwelle, Sensitivity-Sweep) |
 
 ## Konventionen / Gotchas
 

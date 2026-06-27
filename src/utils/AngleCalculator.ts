@@ -1,10 +1,15 @@
 /**
  * AngleCalculator — Vektor-basierte Berechnung des Kniewinkels.
  *
- * Scope-Reduktion: für die Bachelorarbeit wird ausschließlich der
- * Kniewinkel untersucht. Frühere Winkel-Funktionen (Hüfte, Knöchel,
- * Ellbogen, Rücken) wurden bewusst entfernt, um die Mess-App schlank
- * und auf eine abhängige Variable fokussiert zu halten.
+ * Reiner Datensammler: liefert für jedes Tripel (hip, knee, ankle) einen
+ * Winkel zurück, OHNE Confidence-Filter. Selektion (z.B. Frames mit
+ * unzuverlässigen Keypoint-Scores ausschließen) erfolgt erst im
+ * Python-Postprocessing — dort als dokumentierter, variierbarer Parameter.
+ *
+ * Begründung: Ein app-seitiger Filter VOR der Winkelberechnung würde
+ * modellabhängige Teilmengen erzeugen (INT8 verliert systematisch mehr
+ * Frames als FP32) und damit den paired-Vergleich der Quantisierungsstufen
+ * verfälschen (Selection-Bias).
  */
 
 export interface Point2D {
@@ -38,22 +43,15 @@ export function calculateAngle(
 }
 
 /**
- * Berechnet den Kniewinkel zwischen Hüfte, Knie und Knöchel.
- * Liefert null wenn einer der drei Keypoint-Scores unter minConfidence liegt.
+ * Kniewinkel zwischen Hüfte, Knie und Knöchel — immer berechnet, kein Filter.
+ * Postprocessing entscheidet anhand der Keypoint-Scores (im Export pro Frame
+ * enthalten), welche Werte für die Auswertung gelten.
  */
 export function calculateKneeAngle(
   hip: Keypoint,
   knee: Keypoint,
   ankle: Keypoint,
-  minConfidence: number = 0.2,
-): number | null {
-  if (
-    (hip.score !== undefined && hip.score < minConfidence) ||
-    (knee.score !== undefined && knee.score < minConfidence) ||
-    (ankle.score !== undefined && ankle.score < minConfidence)
-  ) {
-    return null;
-  }
+): number {
   return calculateAngle(hip, knee, ankle);
 }
 
@@ -67,21 +65,3 @@ export const SIDE_KEYPOINTS: Record<
   left: { hip: 11, knee: 13, ankle: 15 },
   right: { hip: 12, knee: 14, ankle: 16 },
 };
-
-/**
- * 1 wenn hip+knee+ankle alle über minConfidence liegen, sonst 0.
- * Über Setup-Fenster gemittelt = prospektive Validity-Rate.
- */
-export function isKneeTripleValid(
-  keypoints: Keypoint[],
-  side: BodySide,
-  minConfidence = 0.2,
-): 0 | 1 {
-  const ix = SIDE_KEYPOINTS[side];
-  const hip = keypoints[ix.hip]?.score ?? 0;
-  const knee = keypoints[ix.knee]?.score ?? 0;
-  const ankle = keypoints[ix.ankle]?.score ?? 0;
-  return hip >= minConfidence && knee >= minConfidence && ankle >= minConfidence
-    ? 1
-    : 0;
-}
