@@ -1,15 +1,5 @@
 import { useRef, useEffect, useCallback, useState } from "react";
-import {
-  calculateKneeAngle,
-  SIDE_KEYPOINTS,
-  type BodySide,
-  BiomechanicalAngles,
-  type Keypoint,
-} from "../utils/AngleCalculator";
-import {
-  BiomechanicalAnalyzer,
-  AnalysisResults,
-} from "../services/BiomechanicalAnalyzer";
+import { SIDE_KEYPOINTS, type BodySide } from "../utils/AngleCalculator";
 import type { Pose } from "../hooks/usePoseDetection";
 import { useVideoSource } from "../hooks/useVideoSource";
 
@@ -36,13 +26,10 @@ interface AnalysisViewProps {
     opts?: { record?: boolean },
   ) => Promise<Pose | null>;
   isDetectorReady: boolean;
-  onComplete: (results: AnalysisResults) => void;
   onCancel: () => void;
   onFrameMeasurement?: (pose: Pose) => void;
   onSideLocked?: (side: BodySide) => void;
   onRecordingFinalize?: (
-    interpolatedFrames: number,
-    cyclesDetected: number,
     durationSeconds: number,
     expectedFrames: number,
   ) => void;
@@ -102,7 +89,6 @@ function seekTo(video: HTMLVideoElement, t: number): Promise<boolean> {
 export function AnalysisView({
   detectPose,
   isDetectorReady,
-  onComplete,
   onCancel,
   onFrameMeasurement,
   onSideLocked,
@@ -116,7 +102,6 @@ export function AnalysisView({
 }: AnalysisViewProps) {
   const videoRef = useRef<HTMLVideoElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
-  const analyzerRef = useRef<BiomechanicalAnalyzer | null>(null);
   const onFrameRef = useRef(onFrameMeasurement);
 
   const [phase, setPhase] = useState<AnalysisPhase>("setup");
@@ -140,13 +125,6 @@ export function AnalysisView({
     file: videoFile,
     targetFps,
   });
-
-  useEffect(() => {
-    analyzerRef.current = new BiomechanicalAnalyzer();
-    return () => {
-      analyzerRef.current = null;
-    };
-  }, []);
 
   const drawSkeleton = useCallback(
     (
@@ -201,7 +179,6 @@ export function AnalysisView({
   // Teildaten als gültige Validierungsmetriken im Export. Parent setzt Session
   // via onRecordingAbort zurück.
   const handleStop = useCallback(() => {
-    analyzerRef.current?.reset();
     onRecordingActiveChange?.(false);
     onRecordingAbort?.();
     setLockedSide(null);
@@ -271,15 +248,13 @@ export function AnalysisView({
     const run = async () => {
       const video = videoRef.current;
       const canvas = canvasRef.current;
-      const analyzer = analyzerRef.current;
-      if (!video || !canvas || !analyzer) return;
+      if (!video || !canvas) return;
       const ctx = canvas.getContext("2d");
       if (!ctx) return;
 
-      // Jeder (Re-)Lauf startet mit frischem Analyzer UND frischem Warmup-/
-      // Frame-Fenster, damit frameIndex bei 1 startet und keine Frames doppelt
-      // gezählt werden (StrictMode / unerwarteter Effekt-Neustart).
-      analyzer.reset();
+      // Frame-Zähler / Warmup-Fenster im Hook zurücksetzen, damit frameIndex
+      // bei 1 startet und keine Frames doppelt gezählt werden
+      // (StrictMode / unerwarteter Effekt-Neustart).
       onRecordingStart?.();
 
       // Verwirft eine fehlgeschlagene/unvollständige Aufnahme statt sie zu
@@ -305,8 +280,6 @@ export function AnalysisView({
         return;
       }
 
-      const ix = SIDE_KEYPOINTS[lockedSide];
-
       for (let i = 0; i < total && !cancelled; i++) {
         // Frame-Mitte ansteuern, robust gegen Rundung an Frame-Grenzen.
         const ok = await seekTo(video, (i + 0.5) / targetFps);
@@ -322,38 +295,19 @@ export function AnalysisView({
         ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
 
         if (pose) {
+          // Reiner Datensammler: Pose an Parent für Export, Skeleton-Render.
+          // Winkelberechnung/Statistik passiert im Python-Postprocessing.
           onFrameRef.current?.(pose);
           drawSkeleton(ctx, pose.keypoints);
-
-          const hip = pose.keypoints[ix.hip] as Keypoint;
-          const knee = pose.keypoints[ix.knee] as Keypoint;
-          const ankle = pose.keypoints[ix.ankle] as Keypoint;
-          const angles: BiomechanicalAngles = {
-            knee: calculateKneeAngle(hip, knee, ankle),
-          };
-          const relevant = [hip, knee, ankle];
-          const avgConfidence =
-            relevant.reduce((s, k) => s + (k.score || 0), 0) / relevant.length;
-
-          // Cycle-Detection läuft weiter (Export-Felder), aber KEINE UI-Updates
-          // pro Frame — die App ist Daten-Sammler, nicht Live-Anzeige.
-          analyzer.addFrame(angles, avgConfidence);
         }
 
         setVideoProgress((i + 1) / total);
       }
 
       if (!cancelled) {
-        const results = analyzer.getResults();
         onRecordingActiveChange?.(false);
         setPhase("complete");
-        onRecordingFinalize?.(
-          analyzer.getInterpolatedFramesCount(),
-          analyzer.getCycleCount(),
-          dur,
-          total,
-        );
-        if (results) onComplete(results);
+        onRecordingFinalize?.(dur, total);
       }
     };
 
@@ -369,7 +323,6 @@ export function AnalysisView({
     sourceState.isReady,
     detectPose,
     drawSkeleton,
-    onComplete,
     onRecordingFinalize,
     onRecordingActiveChange,
     onRecordingStart,

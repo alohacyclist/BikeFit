@@ -33,8 +33,6 @@ export interface ValidationMetrics {
   validKneeRatioLeft: number;
   validKneeRatioSelected: number; // bezogen auf lockedSide
   meanKeypointScores: number[]; // pro KP-Index, gemittelt über non-warmup Frames
-  interpolatedFrames: number; // wie viele Frames per Hold-Last-Value überbrückt
-  totalCyclesDetected: number;
 }
 
 export interface BenchmarkSession {
@@ -141,18 +139,13 @@ export class BenchmarkExporter {
    * Berechnet Validierungs-Aggregate aus den non-warmup Frames.
    * Wird beim Export aufgerufen und auf die Session geschrieben.
    */
-  private computeValidationMetrics(
-    interpolatedFrames: number,
-    totalCyclesDetected: number,
-  ): ValidationMetrics {
+  private computeValidationMetrics(): ValidationMetrics {
     if (!this.session) {
       return {
         validKneeRatioRight: 0,
         validKneeRatioLeft: 0,
         validKneeRatioSelected: 0,
         meanKeypointScores: [],
-        interpolatedFrames: 0,
-        totalCyclesDetected: 0,
       };
     }
     const valid = this.session.frames.filter((f) => !f.isWarmup);
@@ -179,21 +172,16 @@ export class BenchmarkExporter {
       validKneeRatioLeft: validLeft,
       validKneeRatioSelected: validSel,
       meanKeypointScores: meanScores,
-      interpolatedFrames,
-      totalCyclesDetected,
     };
   }
 
   /**
    * Schreibt die Validierungsmetriken in die aktive Session.
-   * Aufrufen kurz vor Export, mit aktuellen Werten aus Analyzer.
+   * Aufrufen kurz vor Export.
    */
-  finalizeMetrics(interpolatedFrames: number, cyclesDetected: number): void {
+  finalizeMetrics(): void {
     if (!this.session) return;
-    this.session.validationMetrics = this.computeValidationMetrics(
-      interpolatedFrames,
-      cyclesDetected,
-    );
+    this.session.validationMetrics = this.computeValidationMetrics();
   }
 
   exportJSON(): string {
