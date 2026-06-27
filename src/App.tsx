@@ -97,7 +97,6 @@ function App() {
   const handleRecordingFinalize = useCallback(
     (durationSeconds: number, expectedFrames: number) => {
       benchmarkExporter.setVideoMeta(durationSeconds, expectedFrames);
-      benchmarkExporter.finalizeMetrics();
       setLastSummary({ durationSeconds, expectedFrames });
     },
     [],

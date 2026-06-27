@@ -12,8 +12,13 @@ export interface FrameMeasurement {
   timestampMs: number;
   inferenceMs: number;
   fps: number;
-  kneeAngleRight: number | null;
-  kneeAngleLeft: number | null;
+  /**
+   * Roh-Kniewinkel — kein App-seitiger Confidence-Filter. Selektion erfolgt
+   * im Python-Postprocessing anhand der `keypointScores` mit dort
+   * dokumentierter Schwelle (Sensitivity-Sweep).
+   */
+  kneeAngleRight: number;
+  kneeAngleLeft: number;
   keypointScores: number[];
   isWarmup: boolean;
 }
@@ -26,13 +31,6 @@ interface SystemInfo {
   crossOriginIsolated: boolean;
   /** Ob SharedArrayBuffer im aktuellen Kontext definiert ist. */
   sharedArrayBufferAvailable: boolean;
-}
-
-export interface ValidationMetrics {
-  validKneeRatioRight: number; // 0..1 — Anteil non-warmup Frames mit gültigem rechtem Kniewinkel
-  validKneeRatioLeft: number;
-  validKneeRatioSelected: number; // bezogen auf lockedSide
-  meanKeypointScores: number[]; // pro KP-Index, gemittelt über non-warmup Frames
 }
 
 export interface BenchmarkSession {
@@ -55,7 +53,6 @@ export interface BenchmarkSession {
   /** Erwartete Frame-Anzahl = floor(durationSeconds * targetFps). */
   expectedFrames: number;
   frames: FrameMeasurement[];
-  validationMetrics?: ValidationMetrics;
 }
 
 import { WARMUP_FRAMES } from "../types/quantization";
@@ -133,55 +130,6 @@ export class BenchmarkExporter {
   recordFrame(measurement: FrameMeasurement): void {
     if (!this.session) return;
     this.session.frames.push(measurement);
-  }
-
-  /**
-   * Berechnet Validierungs-Aggregate aus den non-warmup Frames.
-   * Wird beim Export aufgerufen und auf die Session geschrieben.
-   */
-  private computeValidationMetrics(): ValidationMetrics {
-    if (!this.session) {
-      return {
-        validKneeRatioRight: 0,
-        validKneeRatioLeft: 0,
-        validKneeRatioSelected: 0,
-        meanKeypointScores: [],
-      };
-    }
-    const valid = this.session.frames.filter((f) => !f.isWarmup);
-    const n = valid.length || 1;
-    const validRight =
-      valid.filter((f) => f.kneeAngleRight !== null).length / n;
-    const validLeft = valid.filter((f) => f.kneeAngleLeft !== null).length / n;
-    const side = this.session.lockedSide;
-    const validSel =
-      side === "right" ? validRight : side === "left" ? validLeft : 0;
-
-    // Mean keypoint scores: bilde Spaltenmittel über 17 KPs
-    const numKps = valid[0]?.keypointScores.length ?? 17;
-    const meanScores = new Array(numKps).fill(0);
-    for (const f of valid) {
-      for (let i = 0; i < numKps; i++) {
-        meanScores[i] += f.keypointScores[i] ?? 0;
-      }
-    }
-    for (let i = 0; i < numKps; i++) meanScores[i] /= n;
-
-    return {
-      validKneeRatioRight: validRight,
-      validKneeRatioLeft: validLeft,
-      validKneeRatioSelected: validSel,
-      meanKeypointScores: meanScores,
-    };
-  }
-
-  /**
-   * Schreibt die Validierungsmetriken in die aktive Session.
-   * Aufrufen kurz vor Export.
-   */
-  finalizeMetrics(): void {
-    if (!this.session) return;
-    this.session.validationMetrics = this.computeValidationMetrics();
   }
 
   exportJSON(): string {
