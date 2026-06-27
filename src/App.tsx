@@ -3,7 +3,6 @@ import { usePoseDetection, type Pose } from "./hooks/usePoseDetection";
 import { AnalysisView } from "./components/AnalysisView";
 import { QuantizationControls } from "./components/QuantizationControls";
 import { VideoSourcePanel } from "./components/VideoSourcePanel";
-import { AnalysisResults } from "./services/BiomechanicalAnalyzer";
 import { benchmarkExporter } from "./services/BenchmarkExporter";
 import { calculateKneeAngle, type BodySide } from "./utils/AngleCalculator";
 import { KP, type QuantizationLevel } from "./types/quantization";
@@ -34,11 +33,9 @@ function App() {
   const [targetFps, setTargetFps] = useState(30);
   const [forcedSide, setForcedSide] = useState<BodySide>("right");
   const [isRecording, setIsRecording] = useState(false);
-  const [analysisResults, setAnalysisResults] =
-    useState<AnalysisResults | null>(null);
   const [lastSummary, setLastSummary] = useState<{
-    interpolated: number;
-    cycles: number;
+    durationSeconds: number;
+    expectedFrames: number;
   } | null>(null);
 
   // Session bei Detektor-Ready / Level- / Side-Wechsel neu starten
@@ -98,15 +95,10 @@ function App() {
   }, []);
 
   const handleRecordingFinalize = useCallback(
-    (
-      interpolated: number,
-      cycles: number,
-      durationSeconds: number,
-      expectedFrames: number,
-    ) => {
+    (durationSeconds: number, expectedFrames: number) => {
       benchmarkExporter.setVideoMeta(durationSeconds, expectedFrames);
-      benchmarkExporter.finalizeMetrics(interpolated, cycles);
-      setLastSummary({ interpolated, cycles });
+      benchmarkExporter.finalizeMetrics();
+      setLastSummary({ durationSeconds, expectedFrames });
     },
     [],
   );
@@ -140,13 +132,7 @@ function App() {
     [lastMeasurementRef],
   );
 
-  const handleAnalysisComplete = useCallback(
-    (results: AnalysisResults) => setAnalysisResults(results),
-    [],
-  );
-
   const handleResetSession = useCallback(() => {
-    setAnalysisResults(null);
     setLastSummary(null);
     benchmarkExporter.reset();
     benchmarkExporter.startSession(participantId, currentLevel);
@@ -212,7 +198,6 @@ function App() {
           <AnalysisView
             detectPose={detectPose}
             isDetectorReady={!isLoading && detector !== null}
-            onComplete={handleAnalysisComplete}
             onCancel={handleResetSession}
             onFrameMeasurement={handleFrameMeasurement}
             onSideLocked={handleSideLocked}
@@ -288,46 +273,27 @@ function App() {
               )}
             </div>
 
-            {analysisResults && (
+            {lastSummary && (
               <div className="bg-gray-800/50 rounded-lg p-4 border border-green-700/40 text-xs space-y-1">
                 <div className="text-sm font-semibold text-green-400 mb-1">
-                  Letzte Aufnahme abgeschlossen
+                  Aufnahme abgeschlossen
                 </div>
                 <div className="flex justify-between text-gray-400">
-                  <span>Zyklen</span>
+                  <span>Frames</span>
                   <span className="font-mono">
-                    {analysisResults.cycleCount}
+                    {lastSummary.expectedFrames}
                   </span>
                 </div>
                 <div className="flex justify-between text-gray-400">
                   <span>Dauer</span>
                   <span className="font-mono">
-                    {(analysisResults.duration / 1000).toFixed(1)} s
+                    {lastSummary.durationSeconds.toFixed(1)} s
                   </span>
                 </div>
-                <div className="flex justify-between text-gray-400">
-                  <span>Knie max ⌀</span>
-                  <span className="font-mono">
-                    {analysisResults.statistics.kneeExtension.average.toFixed(
-                      1,
-                    )}
-                    °
-                  </span>
-                </div>
-                <div className="flex justify-between text-gray-400">
-                  <span>Knie min ⌀</span>
-                  <span className="font-mono">
-                    {analysisResults.statistics.kneeFlexion.average.toFixed(1)}°
-                  </span>
-                </div>
-                {lastSummary && (
-                  <div className="flex justify-between text-gray-400">
-                    <span>Interpoliert</span>
-                    <span className="font-mono">
-                      {lastSummary.interpolated}
-                    </span>
-                  </div>
-                )}
+                <p className="text-[10px] text-gray-500 pt-1">
+                  Auswertung (Zyklen, Statistik, Genauigkeit): JSON exportieren
+                  → Python-Postprocessing.
+                </p>
                 <button
                   onClick={handleResetSession}
                   className="mt-2 w-full py-1.5 px-3 rounded-md text-xs bg-gray-700 hover:bg-gray-600 text-gray-200"
