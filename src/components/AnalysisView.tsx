@@ -1,7 +1,6 @@
 import { useRef, useEffect, useCallback, useState } from "react";
 import {
   calculateKneeAngle,
-  getAngleColor,
   SIDE_KEYPOINTS,
   type BodySide,
   BiomechanicalAngles,
@@ -10,7 +9,6 @@ import {
 import {
   BiomechanicalAnalyzer,
   AnalysisResults,
-  type CyclePhase,
 } from "../services/BiomechanicalAnalyzer";
 import type { Pose } from "../hooks/usePoseDetection";
 import { useVideoSource } from "../hooks/useVideoSource";
@@ -122,13 +120,8 @@ export function AnalysisView({
   const onFrameRef = useRef(onFrameMeasurement);
 
   const [phase, setPhase] = useState<AnalysisPhase>("setup");
-  const [cycleCount, setCycleCount] = useState(0);
   const [videoProgress, setVideoProgress] = useState(0);
   const [recordingError, setRecordingError] = useState<string | null>(null);
-  const [cyclePhase, setCyclePhase] = useState<CyclePhase>("searching");
-  const [currentAngles, setCurrentAngles] = useState<BiomechanicalAngles>({
-    knee: null,
-  });
   const [lockedSide, setLockedSide] = useState<BodySide | null>(null);
   const [kpScores, setKpScores] = useState<{
     left: { hip: number; knee: number; ankle: number };
@@ -193,26 +186,6 @@ export function AnalysisView({
     [],
   );
 
-  const drawAngleOverlay = useCallback(
-    (
-      ctx: CanvasRenderingContext2D,
-      pos: { x: number; y: number },
-      angle: number,
-      label: string,
-    ) => {
-      const color = getAngleColor(angle);
-      const text = `${label}: ${angle.toFixed(0)}°`;
-      ctx.font = "bold 14px monospace";
-      const m = ctx.measureText(text);
-      const p = 4;
-      ctx.fillStyle = "rgba(0,0,0,0.8)";
-      ctx.fillRect(pos.x - p, pos.y - 16 - p, m.width + p * 2, 20 + p);
-      ctx.fillStyle = color;
-      ctx.fillText(text, pos.x, pos.y - 4);
-    },
-    [],
-  );
-
   const startRecording = useCallback(() => {
     setLockedSide(forcedSide);
     onSideLocked?.(forcedSide);
@@ -220,7 +193,6 @@ export function AnalysisView({
     // Warmup-/Frame-Reset passiert im Recording-Loop (run()), damit jeder
     // (Re-)Lauf konsistent bei frameIndex 1 / Warmup-Fenster 0 startet.
     onRecordingActiveChange?.(true);
-    setCycleCount(0);
     setVideoProgress(0);
     setPhase("recording");
   }, [forcedSide, onSideLocked, onRecordingActiveChange]);
@@ -233,7 +205,6 @@ export function AnalysisView({
     onRecordingActiveChange?.(false);
     onRecordingAbort?.();
     setLockedSide(null);
-    setCycleCount(0);
     setVideoProgress(0);
     if (videoRef.current) {
       videoRef.current.pause();
@@ -364,20 +335,9 @@ export function AnalysisView({
           const avgConfidence =
             relevant.reduce((s, k) => s + (k.score || 0), 0) / relevant.length;
 
+          // Cycle-Detection läuft weiter (Export-Felder), aber KEINE UI-Updates
+          // pro Frame — die App ist Daten-Sammler, nicht Live-Anzeige.
           analyzer.addFrame(angles, avgConfidence);
-          setCurrentAngles(angles);
-          setCycleCount(analyzer.getCycleCount());
-          setCyclePhase(analyzer.getCurrentPhase());
-
-          if (angles.knee !== null) {
-            const drawKnee = pose.keypoints[ix.knee];
-            drawAngleOverlay(
-              ctx,
-              { x: drawKnee.x + 15, y: drawKnee.y },
-              angles.knee,
-              "Knie",
-            );
-          }
         }
 
         setVideoProgress((i + 1) / total);
@@ -409,7 +369,6 @@ export function AnalysisView({
     sourceState.isReady,
     detectPose,
     drawSkeleton,
-    drawAngleOverlay,
     onComplete,
     onRecordingFinalize,
     onRecordingActiveChange,
@@ -431,50 +390,20 @@ export function AnalysisView({
         {phase === "recording" && (
           <div className="absolute top-4 left-4 right-4 flex justify-between items-start pointer-events-none">
             <div className="bg-black/80 backdrop-blur-sm rounded-lg px-4 py-3">
-              <div className="text-sm text-gray-400 mb-1">Analyse</div>
-              <div className="flex items-center gap-3">
-                <div className="text-3xl font-bold text-green-400 tabular-nums">
-                  {cycleCount}
-                </div>
-                <div className="text-sm text-gray-400">Zyklen</div>
-              </div>
-              <div className="mt-2 h-2 bg-gray-700 rounded-full overflow-hidden w-48">
+              <div className="text-sm text-gray-400 mb-1">Aufnahme läuft</div>
+              <div className="h-2 bg-gray-700 rounded-full overflow-hidden w-48">
                 <div
                   className="h-full bg-green-400 transition-all duration-300"
                   style={{ width: `${videoProgress * 100}%` }}
                 />
               </div>
-              <div className="mt-1 text-xs text-gray-400">
+              <div className="mt-1 text-xs text-gray-400 tabular-nums">
                 Video: {(videoProgress * 100).toFixed(0)}%
               </div>
               <div className="mt-2 text-xs text-gray-300">
                 Seite:{" "}
                 <span className="font-semibold text-yellow-300">
                   {lockedSide === "right" ? "rechts" : "links"}
-                </span>
-              </div>
-              <div className="text-xs text-gray-300">
-                Status:{" "}
-                <span
-                  className={
-                    cyclePhase === "searching"
-                      ? "text-yellow-300"
-                      : "text-green-300"
-                  }
-                >
-                  {cyclePhase === "searching"
-                    ? "Warte auf Bewegung"
-                    : cyclePhase === "extension"
-                      ? "Streckung"
-                      : "Beugung"}
-                </span>
-              </div>
-              <div className="text-xs text-gray-300">
-                Knie:{" "}
-                <span className="font-mono text-green-300">
-                  {currentAngles.knee !== null
-                    ? `${currentAngles.knee.toFixed(0)}°`
-                    : "--"}
                 </span>
               </div>
             </div>
