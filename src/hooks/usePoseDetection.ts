@@ -128,8 +128,41 @@ export function usePoseDetection(
     typeof self !== "undefined" &&
     (self as unknown as { crossOriginIsolated?: boolean })
       .crossOriginIsolated === true;
-  const [threadingPreference, setThreadingPreference] =
-    useState<ThreadingPreference>(multiThreadingAvailable ? "multi" : "single");
+  // tfjs-tflite UMD ist Page-Lifetime-Singleton: der WASM-Pthread-Pool wird
+  // nur EINMAL pro Tab initialisiert. Threading-Wechsel zur Laufzeit deadlockt
+  // (Atomics.wait auf belegten SAB-Slots). Daher: gewünschter Modus wird in
+  // sessionStorage persistiert und beim Boot vor dem ersten loadModel gelesen;
+  // Wechsel triggert window.location.reload().
+  const persistedThreading =
+    typeof sessionStorage !== "undefined"
+      ? (sessionStorage.getItem(
+          "edgefit.threading",
+        ) as ThreadingPreference | null)
+      : null;
+  const initialThreading: ThreadingPreference =
+    persistedThreading === "single" || persistedThreading === "multi"
+      ? persistedThreading
+      : multiThreadingAvailable
+        ? "multi"
+        : "single";
+  const [threadingPreference, setThreadingPreferenceState] =
+    useState<ThreadingPreference>(initialThreading);
+
+  const setThreadingPreference = useCallback(
+    (mode: ThreadingPreference) => {
+      if (mode === threadingPreference) return;
+      try {
+        sessionStorage.setItem("edgefit.threading", mode);
+      } catch {
+        // Storage nicht verfügbar → trotzdem reloaden, Init nutzt Default
+      }
+      // Hot-Swap des TFLite-Pthread-Pools ist nicht supported → harter Reload.
+      window.location.reload();
+      // Fallback-State-Update (Reload sollte synchron kommen)
+      setThreadingPreferenceState(mode);
+    },
+    [threadingPreference],
+  );
   const [activeThreadingMode, setActiveThreadingMode] = useState<
     "single" | "multi" | "unknown"
   >("unknown");
@@ -189,146 +222,155 @@ export function usePoseDetection(
   }, []);
 
   // Modell laden (auch bei Level-Wechsel aufrufbar)
-  const loadModel = useCallback(async (level: QuantizationLevel) => {
-    try {
-      setIsLoading(true);
-      setError(null);
-      setIsWarmingUp(true);
-      warmupCounterRef.current = 0;
-      frameTimestamps.current = [];
-      frameCountRef.current = 0;
-
-      // Backend nur einmal initialisieren
-      if (!backendReadyRef.current) {
-        // Threading-Hint für tfjs-backend-wasm setzen (beeinflusst nur tfjs-eigene
-        // Ops, NICHT die TFLite-Inferenz — diese läuft über tfjs-tflite und
-        // wird unten via loadTFLiteModel({numThreads}) konfiguriert).
-        const wantMulti =
-          threadingPreference === "multi" && multiThreadingAvailable;
-        tf.env().set("WASM_HAS_MULTITHREAD_SUPPORT", wantMulti);
-        tf.env().set("WASM_HAS_SIMD_SUPPORT", true);
-
-        // WASM-Binaries vom jsDelivr-CDN laden (Vite serviert sie sonst nicht)
-        setWasmPaths(
-          "https://cdn.jsdelivr.net/npm/@tensorflow/tfjs-backend-wasm@4.22.0/dist/",
-        );
-        await tf.setBackend("wasm");
-        await tf.ready();
-
-        // window.tf MUSS gesetzt sein, BEVOR das tfjs-tflite UMD lädt
-        // — die UMD-Factory captured tf bei der ersten Auswertung.
-        (window as unknown as { tf: typeof tf }).tf = tf;
-
-        // tfjs-tflite UMD dynamisch nachladen
-        await loadTFLiteScript();
-
-        backendReadyRef.current = true;
-        console.log(
-          "TensorFlow.js Backend:",
-          tf.getBackend(),
-          "crossOriginIsolated:",
-          multiThreadingAvailable,
-        );
-      }
-
-      // Altes Modell verwerfen
-      setDetector((prev) => {
-        if (prev) {
-          try {
-            // TFLiteModel stellt keine offizielle dispose-Methode bereit,
-            // GC übernimmt — aber Referenz freigeben
-          } catch {
-            // ignore
-          }
-        }
-        return null;
-      });
-
-      if (!window.tflite) {
-        throw new Error(
-          "window.tflite nicht verfügbar — UMD-Script in index.html prüfen",
-        );
-      }
-
-      // tfjs-tflite hat eigene WASM-Binaries (getrennt vom backend-wasm).
-      // Pfad einmalig auf jsDelivr setzen, damit _malloc verfügbar wird.
-      if (window.tflite.setWasmPath) {
-        // alpha.9 enthält die .wasm-Binaries; alpha.10 nicht
-        window.tflite.setWasmPath(
-          "https://cdn.jsdelivr.net/npm/@tensorflow/tfjs-tflite@0.0.1-alpha.9/dist/",
-        );
-      }
-      // numThreads für TFLite-Runtime — nur wenn Multi-Threading wirklich
-      // verfügbar UND vom Nutzer gewünscht. Sonst single-thread.
-      // Cap bei 4: tfjs-MT-Speedup ist sublinear, höhere Werte bringen
-      // wegen Synchronisations-Overhead bei kleinen Modellen nichts.
-      const useMulti =
-        threadingPreference === "multi" && multiThreadingAvailable;
-      const numThreads = useMulti
-        ? Math.min(navigator.hardwareConcurrency || 4, 4)
-        : 1;
-
-      // Modell-Fingerprint parallel berechnen (zweiter fetch trifft Browser-Cache).
-      // Fail-Safe: falls TFLite mit numThreads scheitert (z.B. weil Pthread-Pool
-      // nicht initialisiert werden kann), Retry mit numThreads=1.
-      let model: TFLiteModelLike;
-      let actuallyMulti = useMulti;
+  const loadModel = useCallback(
+    async (level: QuantizationLevel) => {
       try {
-        model = await window.tflite.loadTFLiteModel(TFLITE_MODEL_URLS[level], {
-          numThreads,
-        });
-      } catch (e) {
-        if (useMulti) {
-          console.warn(
-            "TFLite Multi-Thread-Load fehlgeschlagen, Fallback auf Single:",
-            e,
+        setIsLoading(true);
+        setError(null);
+        setIsWarmingUp(true);
+        warmupCounterRef.current = 0;
+        frameTimestamps.current = [];
+        frameCountRef.current = 0;
+
+        // Backend nur einmal initialisieren
+        if (!backendReadyRef.current) {
+          // Threading-Hint für tfjs-backend-wasm setzen (beeinflusst nur tfjs-eigene
+          // Ops, NICHT die TFLite-Inferenz — diese läuft über tfjs-tflite und
+          // wird unten via loadTFLiteModel({numThreads}) konfiguriert).
+          const wantMulti =
+            threadingPreference === "multi" && multiThreadingAvailable;
+          tf.env().set("WASM_HAS_MULTITHREAD_SUPPORT", wantMulti);
+          tf.env().set("WASM_HAS_SIMD_SUPPORT", true);
+
+          // WASM-Binaries vom jsDelivr-CDN laden (Vite serviert sie sonst nicht)
+          setWasmPaths(
+            "https://cdn.jsdelivr.net/npm/@tensorflow/tfjs-backend-wasm@4.22.0/dist/",
           );
-          actuallyMulti = false;
+          await tf.setBackend("wasm");
+          await tf.ready();
+
+          // window.tf MUSS gesetzt sein, BEVOR das tfjs-tflite UMD lädt
+          // — die UMD-Factory captured tf bei der ersten Auswertung.
+          (window as unknown as { tf: typeof tf }).tf = tf;
+
+          // tfjs-tflite UMD dynamisch nachladen
+          await loadTFLiteScript();
+
+          backendReadyRef.current = true;
+          console.log(
+            "TensorFlow.js Backend:",
+            tf.getBackend(),
+            "crossOriginIsolated:",
+            multiThreadingAvailable,
+          );
+        }
+
+        // Altes Modell verwerfen
+        setDetector((prev) => {
+          if (prev) {
+            try {
+              // TFLiteModel stellt keine offizielle dispose-Methode bereit,
+              // GC übernimmt — aber Referenz freigeben
+            } catch {
+              // ignore
+            }
+          }
+          return null;
+        });
+
+        if (!window.tflite) {
+          throw new Error(
+            "window.tflite nicht verfügbar — UMD-Script in index.html prüfen",
+          );
+        }
+
+        // tfjs-tflite hat eigene WASM-Binaries (getrennt vom backend-wasm).
+        // Pfad einmalig auf jsDelivr setzen, damit _malloc verfügbar wird.
+        if (window.tflite.setWasmPath) {
+          // alpha.9 enthält die .wasm-Binaries; alpha.10 nicht
+          window.tflite.setWasmPath(
+            "https://cdn.jsdelivr.net/npm/@tensorflow/tfjs-tflite@0.0.1-alpha.9/dist/",
+          );
+        }
+        // numThreads für TFLite-Runtime — nur wenn Multi-Threading wirklich
+        // verfügbar UND vom Nutzer gewünscht. Sonst single-thread.
+        // Cap bei 4: tfjs-MT-Speedup ist sublinear, höhere Werte bringen
+        // wegen Synchronisations-Overhead bei kleinen Modellen nichts.
+        const useMulti =
+          threadingPreference === "multi" && multiThreadingAvailable;
+        const numThreads = useMulti
+          ? Math.min(navigator.hardwareConcurrency || 4, 4)
+          : 1;
+
+        // Modell-Fingerprint parallel berechnen (zweiter fetch trifft Browser-Cache).
+        // Fail-Safe: falls TFLite mit numThreads scheitert (z.B. weil Pthread-Pool
+        // nicht initialisiert werden kann), Retry mit numThreads=1.
+        let model: TFLiteModelLike;
+        let actuallyMulti = useMulti;
+        try {
           model = await window.tflite.loadTFLiteModel(
             TFLITE_MODEL_URLS[level],
             {
-              numThreads: 1,
+              numThreads,
             },
           );
-        } else {
-          throw e;
+        } catch (e) {
+          if (useMulti) {
+            console.warn(
+              "TFLite Multi-Thread-Load fehlgeschlagen, Fallback auf Single:",
+              e,
+            );
+            actuallyMulti = false;
+            model = await window.tflite.loadTFLiteModel(
+              TFLITE_MODEL_URLS[level],
+              {
+                numThreads: 1,
+              },
+            );
+          } else {
+            throw e;
+          }
         }
+        const fingerprint = await fingerprintModel(
+          TFLITE_MODEL_URLS[level],
+        ).catch((e) => {
+          console.warn("Fingerprint fehlgeschlagen:", e);
+          return null;
+        });
+
+        // activeThreadingMode jetzt anhand des TATSÄCHLICH genutzten Pfads setzen,
+        // nicht anhand der vorher gesetzten Flag (tautologisch).
+        const realNumThreads = actuallyMulti ? numThreads : 1;
+        setActiveThreadingMode(actuallyMulti ? "multi" : "single");
+        setActiveNumThreads(realNumThreads);
+
+        levelRef.current = level;
+        setCurrentLevel(level);
+        setModelFingerprint(fingerprint);
+        setDetector(model);
+        setIsLoading(false);
+
+        // Modell ist geladen — UI-State "einsatzbereit" sofort setzen.
+        // Der per-Frame isWarmup-Flag (warmupCounterRef in detectPose) markiert
+        // die ersten WARMUP_FRAMES realen Inferenzen weiterhin als Warmup im
+        // JSON-Export. Postprocessing in Python filtert diese aus.
+        setIsWarmingUp(false);
+        console.log(`TFLite-Modell geladen (${level})`);
+      } catch (err) {
+        const message =
+          err instanceof Error
+            ? err.message
+            : "Modell konnte nicht geladen werden";
+        setError(message);
+        setIsLoading(false);
+        console.error("Modell-Initialisierung fehlgeschlagen:", err);
       }
-      const fingerprint = await fingerprintModel(
-        TFLITE_MODEL_URLS[level],
-      ).catch((e) => {
-        console.warn("Fingerprint fehlgeschlagen:", e);
-        return null;
-      });
-
-      // activeThreadingMode jetzt anhand des TATSÄCHLICH genutzten Pfads setzen,
-      // nicht anhand der vorher gesetzten Flag (tautologisch).
-      const realNumThreads = actuallyMulti ? numThreads : 1;
-      setActiveThreadingMode(actuallyMulti ? "multi" : "single");
-      setActiveNumThreads(realNumThreads);
-
-      levelRef.current = level;
-      setCurrentLevel(level);
-      setModelFingerprint(fingerprint);
-      setDetector(model);
-      setIsLoading(false);
-
-      // Modell ist geladen — UI-State "einsatzbereit" sofort setzen.
-      // Der per-Frame isWarmup-Flag (warmupCounterRef in detectPose) markiert
-      // die ersten WARMUP_FRAMES realen Inferenzen weiterhin als Warmup im
-      // JSON-Export. Postprocessing in Python filtert diese aus.
-      setIsWarmingUp(false);
-      console.log(`TFLite-Modell geladen (${level})`);
-    } catch (err) {
-      const message =
-        err instanceof Error
-          ? err.message
-          : "Modell konnte nicht geladen werden";
-      setError(message);
-      setIsLoading(false);
-      console.error("Modell-Initialisierung fehlgeschlagen:", err);
-    }
-  }, []);
+      // Audit-Fix: leere Deps lasen stale threadingPreference + multiThreadingAvailable.
+      // Mit Reload-on-Toggle ist beides effektiv konstant pro Session — die Deps
+      // sind trotzdem korrekt deklariert, damit React-Hook-Lint-Regel erfüllt ist.
+    },
+    [threadingPreference, multiThreadingAvailable],
+  );
 
   // Initiales Laden
   useEffect(() => {

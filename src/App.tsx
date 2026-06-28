@@ -70,20 +70,13 @@ function App() {
   );
 
   const handleThreadingChange = useCallback(
-    async (mode: "single" | "multi") => {
-      if (mode === threadingPreference) return;
+    (mode: "single" | "multi") => {
+      // setThreadingPreference persistiert in sessionStorage und triggert
+      // window.location.reload() — TFLite-UMD ist Page-Singleton, Hot-Swap
+      // des Pthread-Pools würde deadlocken.
       setThreadingPreference(mode);
-      // Backend muss vollständig neu für anderen Threading-Modus
-      await resetBackend();
-      await loadModel(currentLevel);
     },
-    [
-      threadingPreference,
-      setThreadingPreference,
-      resetBackend,
-      loadModel,
-      currentLevel,
-    ],
+    [setThreadingPreference],
   );
 
   const handleExport = useCallback(() => {
