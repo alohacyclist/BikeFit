@@ -90,6 +90,11 @@ function App() {
   const handleRecordingFinalize = useCallback(
     (durationSeconds: number, expectedFrames: number) => {
       benchmarkExporter.setVideoMeta(durationSeconds, expectedFrames);
+      // Auto-Export: Session-Daten werden beim nächsten Setting-Wechsel
+      // (Quantisierung/Threading/Datei/ID) zurückgesetzt — daher sofort
+      // herunterladen, sobald die Aufnahme sauber durchgelaufen ist.
+      // Abgebrochene Aufnahmen rufen diesen Pfad NICHT, sondern onRecordingAbort.
+      benchmarkExporter.downloadJSON();
       setLastSummary({ durationSeconds, expectedFrames });
     },
     [],
