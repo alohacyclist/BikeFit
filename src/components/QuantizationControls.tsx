@@ -22,6 +22,15 @@ interface QuantizationControlsProps {
   activeThreadingMode: "single" | "multi" | "unknown";
   /** Während laufender Aufnahme: Stufe/Seite/Threading dürfen nicht wechseln. */
   recording?: boolean;
+
+  /**
+   * Voll-Sequenz: einmal klicken, App iteriert FP32 → FP16 → INT8 automatisch
+   * mit identischen Lock-Parametern und exportiert pro Stufe ein JSON.
+   */
+  onRunFullSequence?: () => void;
+  sequenceTotal?: number;
+  sequenceRemaining?: number;
+  canStartSequence?: boolean;
 }
 
 const LEVELS: QuantizationLevel[] = ["fp32", "fp16", "int8"];
@@ -42,8 +51,16 @@ export function QuantizationControls({
   multiThreadingAvailable,
   activeThreadingMode,
   recording = false,
+  onRunFullSequence,
+  sequenceTotal = 0,
+  sequenceRemaining = 0,
+  canStartSequence = false,
 }: QuantizationControlsProps) {
   const disabled = isLoading || isWarmingUp || recording;
+  const sequenceActive = sequenceRemaining > 0;
+  const sequenceCurrentStage = sequenceActive
+    ? sequenceTotal - sequenceRemaining + 1
+    : null;
 
   return (
     <div className="bg-gray-800/60 rounded-lg p-4 border border-gray-700 space-y-4">
@@ -188,6 +205,49 @@ export function QuantizationControls({
       >
         JSON exportieren
       </button>
+
+      {/* Voll-Sequenz: iteriert alle drei Quantisierungsstufen automatisch */}
+      {onRunFullSequence && (
+        <div className="border-t border-gray-700 pt-3 space-y-2">
+          <h3 className="text-sm font-semibold text-gray-300">Voll-Sequenz</h3>
+          {sequenceActive && sequenceCurrentStage !== null ? (
+            <div className="space-y-1">
+              <div className="text-xs text-blue-300 font-mono">
+                Stufe {sequenceCurrentStage} / {sequenceTotal} läuft (
+                {currentLevel.toUpperCase()})
+              </div>
+              <div className="h-2 bg-gray-700 rounded-full overflow-hidden">
+                <div
+                  className="h-full bg-blue-500 transition-all duration-300"
+                  style={{
+                    width: `${
+                      ((sequenceTotal - sequenceRemaining) / sequenceTotal) *
+                      100
+                    }%`,
+                  }}
+                />
+              </div>
+            </div>
+          ) : (
+            <button
+              onClick={onRunFullSequence}
+              disabled={!canStartSequence}
+              className={`w-full py-2 px-3 rounded-md text-sm font-semibold transition-colors ${
+                canStartSequence
+                  ? "bg-blue-600 hover:bg-blue-700 text-white"
+                  : "bg-gray-700 text-gray-500 cursor-not-allowed"
+              }`}
+            >
+              Voll-Sequenz starten (FP32 → FP16 → INT8)
+            </button>
+          )}
+          <p className="text-[10px] text-gray-500 leading-snug">
+            Iteriert automatisch alle drei Quantisierungsstufen mit identischer
+            Datei + identischen Lock-Parametern. Pro Stufe wird ein JSON
+            heruntergeladen.
+          </p>
+        </div>
+      )}
     </div>
   );
 }

@@ -46,6 +46,12 @@ interface AnalysisViewProps {
   forcedSide: BodySide;
   /** Ziel-Framerate für deterministisches Seek-Stepping. */
   targetFps: number;
+  /**
+   * Inkrementierender Zähler: jeder neue Wert (>0, geändert seit letztem Mount)
+   * triggert programmatisch einen Recording-Start. Genutzt von der
+   * Voll-Sequenz-Orchestrierung in App.tsx.
+   */
+  autoStartTrigger?: number;
 }
 
 /**
@@ -99,10 +105,12 @@ export function AnalysisView({
   videoFile,
   forcedSide,
   targetFps,
+  autoStartTrigger,
 }: AnalysisViewProps) {
   const videoRef = useRef<HTMLVideoElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const onFrameRef = useRef(onFrameMeasurement);
+  const lastAutoTriggerRef = useRef<number>(0);
 
   const [phase, setPhase] = useState<AnalysisPhase>("setup");
   const [videoProgress, setVideoProgress] = useState(0);
@@ -174,6 +182,29 @@ export function AnalysisView({
     setVideoProgress(0);
     setPhase("recording");
   }, [forcedSide, onSideLocked, onRecordingActiveChange]);
+
+  // Voll-Sequenz-Hook: Wenn der Parent autoStartTrigger inkrementiert (und wir
+  // in Setup + bereit sind), startet eine neue Aufnahme automatisch.
+  useEffect(() => {
+    if (!autoStartTrigger || autoStartTrigger === lastAutoTriggerRef.current)
+      return;
+    lastAutoTriggerRef.current = autoStartTrigger;
+    if (
+      phase === "setup" &&
+      isDetectorReady &&
+      videoFile &&
+      sourceState.isReady
+    ) {
+      startRecording();
+    }
+  }, [
+    autoStartTrigger,
+    phase,
+    isDetectorReady,
+    videoFile,
+    sourceState.isReady,
+    startRecording,
+  ]);
 
   // Manueller Abbruch: Aufnahme VERWERFEN (nicht finalisieren) — sonst landen
   // Teildaten als gültige Validierungsmetriken im Export. Parent setzt Session
