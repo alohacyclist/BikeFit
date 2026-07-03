@@ -38,6 +38,14 @@ function App() {
     expectedFrames: number;
   } | null>(null);
 
+  // Voll-Sequenz: automatisches Durchlaufen aller drei Quantisierungsstufen
+  // mit demselben Video + denselben Lock-Parametern (Side, Threading).
+  // `sequenceQueue` enthält die noch ausstehenden Stufen; `autoStartTrigger`
+  // ist ein Zähler, dessen Inkrement an AnalysisView signalisiert "jetzt starten".
+  const [sequenceQueue, setSequenceQueue] = useState<QuantizationLevel[]>([]);
+  const [autoStartTrigger, setAutoStartTrigger] = useState(0);
+  const SEQUENCE_ORDER: QuantizationLevel[] = ["fp32", "fp16", "int8"];
+
   // Session bei Detektor-Ready / Level- / Side-Wechsel neu starten
   useEffect(() => {
     if (!detector) return;
@@ -96,9 +104,44 @@ function App() {
       // Abgebrochene Aufnahmen rufen diesen Pfad NICHT, sondern onRecordingAbort.
       benchmarkExporter.downloadJSON();
       setLastSummary({ durationSeconds, expectedFrames });
+      // Voll-Sequenz: aktuelle Stufe abhaken; Drive-Effect lädt die nächste.
+      setSequenceQueue((q) => q.slice(1));
     },
     [],
   );
+
+  const handleRunFullSequence = useCallback(() => {
+    if (!videoFile || !detector || isRecording) return;
+    setSequenceQueue([...SEQUENCE_ORDER]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [videoFile, detector, isRecording]);
+
+  // Drive-Effect: führt die Sequenz schrittweise aus
+  //   1. Wenn aktuelles Level nicht dem Queue-Kopf entspricht: Modell wechseln.
+  //   2. Wenn Detector bereit, kein Recording läuft: autoStartTrigger inkrementieren
+  //      → AnalysisView startet eine neue Aufnahme.
+  useEffect(() => {
+    if (sequenceQueue.length === 0) return;
+    if (!detector || isLoading || isWarmingUp || isRecording) return;
+    const nextLevel = sequenceQueue[0];
+    if (currentLevel !== nextLevel) {
+      void (async () => {
+        await resetBackend();
+        await loadModel(nextLevel);
+      })();
+      return;
+    }
+    setAutoStartTrigger((n) => n + 1);
+  }, [
+    sequenceQueue,
+    detector,
+    isLoading,
+    isWarmingUp,
+    isRecording,
+    currentLevel,
+    resetBackend,
+    loadModel,
+  ]);
 
   const handleFrameMeasurement = useCallback(
     (pose: Pose) => {
@@ -130,6 +173,8 @@ function App() {
   );
 
   const handleResetSession = useCallback(() => {
+    // Abbruch beendet auch eine laufende Voll-Sequenz — keine Teil-Sequenz.
+    setSequenceQueue([]);
     setLastSummary(null);
     benchmarkExporter.reset();
     benchmarkExporter.startSession(participantId, currentLevel);
@@ -205,6 +250,7 @@ function App() {
             videoFile={videoFile}
             forcedSide={forcedSide}
             targetFps={targetFps}
+            autoStartTrigger={autoStartTrigger}
           />
 
           <div className="space-y-4">
@@ -231,6 +277,17 @@ function App() {
               multiThreadingAvailable={multiThreadingAvailable}
               activeThreadingMode={activeThreadingMode}
               recording={isRecording}
+              onRunFullSequence={handleRunFullSequence}
+              sequenceTotal={SEQUENCE_ORDER.length}
+              sequenceRemaining={sequenceQueue.length}
+              canStartSequence={
+                !!videoFile &&
+                !!detector &&
+                !isLoading &&
+                !isWarmingUp &&
+                !isRecording &&
+                sequenceQueue.length === 0
+              }
             />
 
             <div className="bg-gray-800/50 rounded-lg p-4 border border-gray-700 text-xs space-y-1">
