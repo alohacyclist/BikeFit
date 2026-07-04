@@ -6,3 +6,11 @@ dist/
 .idea/
 *.log
 public/models/*.tflite
+
+# Python cache
+__pycache__/
+*.pyc
+
+# Post-processing output / throwaway artifacts
+ergebnisse.json
+results/
