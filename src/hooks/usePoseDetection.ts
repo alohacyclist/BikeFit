@@ -7,6 +7,9 @@ import { setWasmPaths } from "@tensorflow/tfjs-backend-wasm";
 // wegen fehlender Submodule). Stellt window.tflite bereit.
 interface TFLiteModelLike {
   predict: (input: tf.Tensor | tf.Tensor[]) => tf.Tensor | tf.Tensor[];
+  /** Nicht offiziell dokumentiert für alpha.9, aber vorhanden — versuchen wir. */
+  cleanUp?: () => void;
+  dispose?: () => void;
 }
 interface TFLiteLoadOptions {
   numThreads?: number;
@@ -54,6 +57,7 @@ import {
   fingerprintModel,
   type ModelFingerprint,
 } from "../utils/modelFingerprint";
+import type { DroppedFrameReason } from "../services/BenchmarkExporter";
 
 export interface PoseMetrics {
   inferenceTime: number;
@@ -68,7 +72,20 @@ export interface LastMeasurement {
   inferenceMs: number;
   fps: number;
   frameIndex: number;
+  /** performance.now() VOR predict — Vertrag-Feld FrameMeasurement.timestampMs. */
+  timestampMs: number;
   isWarmup: boolean;
+}
+
+/**
+ * Ergebnis eines detectPose-Aufrufs. Bei Erfolg ist `pose` gesetzt; bei
+ * Misserfolg ist `pose` null und `reason` trägt den Vertrag-konformen Grund
+ * (seek_timeout wird vom Aufrufer, nicht hier, vergeben).
+ */
+export interface DetectResult {
+  pose: Pose | null;
+  reason?: DroppedFrameReason;
+  message?: string;
 }
 
 export type ThreadingPreference = "single" | "multi";
@@ -82,7 +99,7 @@ export interface UsePoseDetectionResult {
   detectPose: (
     video: HTMLVideoElement,
     opts?: { record?: boolean },
-  ) => Promise<Pose | null>;
+  ) => Promise<DetectResult>;
   loadModel: (level: QuantizationLevel) => Promise<void>;
   resetBackend: () => Promise<void>;
   /** Startet das Warmup-Fenster für die kommende Aufnahme neu. */
@@ -90,6 +107,12 @@ export interface UsePoseDetectionResult {
   currentLevel: QuantizationLevel;
   isWarmingUp: boolean;
   lastMeasurementRef: React.MutableRefObject<LastMeasurement | null>;
+  /**
+   * modelLoadMs der laufenden Aufnahme: Zeit von loadModel-Start (Fetch) bis
+   * zum ersten erfolgreichen NON-Warmup-predict. null bis dahin. beginWarmup
+   * setzt zurück; erster valider Frame stempelt den Wert.
+   */
+  modelLoadMsRef: React.MutableRefObject<number | null>;
   /** Fingerprint des aktuell geladenen Modells (null vor erstem Load). */
   modelFingerprint: ModelFingerprint | null;
   /** Vom Nutzer gewählter Threading-Modus. */
@@ -180,6 +203,10 @@ export function usePoseDetection(
   const backendReadyRef = useRef(false);
   const levelRef = useRef<QuantizationLevel>(initialLevel);
   const lastMeasurementRef = useRef<LastMeasurement | null>(null);
+  // modelLoadMs-Messung: loadStart bei loadModel gesetzt, Wert beim ersten
+  // NON-Warmup-Frame gestempelt (siehe detectPose / beginWarmup).
+  const loadStartRef = useRef<number>(0);
+  const modelLoadMsRef = useRef<number | null>(null);
 
   /**
    * Vollständiger Backend-Reset: verwirft Variablen, leert Engine-State.
@@ -189,11 +216,27 @@ export function usePoseDetection(
    */
   const resetBackend = useCallback(async () => {
     try {
+      // Alten Detector explizit freigeben — sonst hält die TFLite-Runtime
+      // ggf. Referenzen, die den nächsten Modell-Load deadlocken (siehe
+      // Threading-Audit: alpha.9 ist page-lifetime-singleton).
+      setDetector((prev) => {
+        if (prev) {
+          try {
+            prev.cleanUp?.();
+            prev.dispose?.();
+          } catch (e) {
+            console.warn("Detector cleanup fehlgeschlagen:", e);
+          }
+        }
+        return null;
+      });
       tf.disposeVariables();
       tf.engine().reset();
       // Re-Init beim nächsten loadModel erzwingen
       backendReadyRef.current = false;
-      setDetector(null);
+      // Kleine Pause, damit TFLite-Runtime interne Buffer freigeben kann
+      // bevor das nächste Modell geladen wird (empirisch, keine offizielle API).
+      await new Promise((resolve) => setTimeout(resolve, 50));
     } catch (e) {
       console.error("Backend-Reset fehlgeschlagen:", e);
     }
@@ -219,12 +262,17 @@ export function usePoseDetection(
     warmupCounterRef.current = 0;
     frameCountRef.current = 0;
     frameTimestamps.current = [];
+    // modelLoadMs neu messen: der erste NON-Warmup-Frame dieser Aufnahme
+    // stempelt (jetzt − loadStart). loadStart wurde in loadModel gesetzt.
+    modelLoadMsRef.current = null;
   }, []);
 
   // Modell laden (auch bei Level-Wechsel aufrufbar)
   const loadModel = useCallback(
     async (level: QuantizationLevel) => {
       try {
+        // modelLoadMs-Start: Fetch/Init dieser Stufe (Vertrag: Fetch-Start).
+        loadStartRef.current = performance.now();
         setIsLoading(true);
         setError(null);
         setIsWarmingUp(true);
@@ -394,9 +442,13 @@ export function usePoseDetection(
     async (
       video: HTMLVideoElement,
       opts?: { record?: boolean },
-    ): Promise<Pose | null> => {
+    ): Promise<DetectResult> => {
       if (!detector || video.readyState < 2) {
-        return null;
+        return {
+          pose: null,
+          reason: "other",
+          message: "Detector/Video nicht bereit",
+        };
       }
 
       const record = opts?.record ?? true;
@@ -411,16 +463,39 @@ export function usePoseDetection(
             MODEL_INPUT_SIZE,
             MODEL_INPUT_SIZE,
           ]);
-          // INT8 erwartet uint8; FP32/FP16 erwarten float32.
-          // resizeBilinear liefert float32 — bei int8 wieder zurück casten.
-          const typed = level === "int8" ? tf.cast(resized, "int32") : resized;
+          // MoveNet Kaggle-Modelle: Input-dtype ist uint8 für BEIDE fp16 UND int8,
+          // nur fp32 erwartet float32. Die Bezeichnungen fp16/int8 beziehen sich
+          // auf die Quantisierung der GEWICHTE, nicht auf den Input-Typ.
+          // resizeBilinear liefert float32 — bei uint8-Input zurück casten.
+          const needsIntInput = level === "int8" || level === "fp16";
+          const typed = needsIntInput ? tf.cast(resized, "int32") : resized;
           return tf.expandDims(typed, 0);
         });
 
         const t0 = performance.now();
         outputTensor = detector.predict(inputTensor) as tf.Tensor;
-        // Warten bis GPU/WASM-Arbeit fertig
-        await outputTensor.data();
+        // Warten bis GPU/WASM-Arbeit fertig — GPU/WASM-Sync ist der eigentliche
+        // Readback-Punkt; eigener catch für Vertrag-Grund "readback_error".
+        try {
+          await outputTensor.data();
+        } catch (readbackErr) {
+          inputTensor.dispose();
+          if (outputTensor) {
+            try {
+              outputTensor.dispose();
+            } catch {
+              // ignore
+            }
+            outputTensor = null;
+          }
+          const message =
+            readbackErr instanceof Error
+              ? readbackErr.message
+              : String(readbackErr);
+          console.error("Readback-Fehler:", readbackErr);
+          setError(`Readback-Fehler (${level}): ${message}`);
+          return { pose: null, reason: "readback_error", message };
+        }
         const inferenceMs = performance.now() - t0;
 
         // Input nach Inferenz freigeben
@@ -453,7 +528,7 @@ export function usePoseDetection(
         // Setup-Preview (record=false) darf die Messzähler NICHT verbrauchen —
         // sonst stiehlt eine Preview-Inferenz Warmup-/Frame-Budget der Aufnahme.
         if (!record) {
-          return pose;
+          return { pose };
         }
 
         // Per-Frame Warmup-Flag — markiert die ersten WARMUP_FRAMES Inferenzen
@@ -461,6 +536,13 @@ export function usePoseDetection(
         // UI-State (isWarmingUp) wird NICHT mehr hier gesetzt — siehe loadModel.
         warmupCounterRef.current += 1;
         const inWarmup = warmupCounterRef.current <= WARMUP_FRAMES;
+
+        // modelLoadMs einmal pro Aufnahme stempeln: erster valider (Non-Warmup)
+        // Frame markiert "Modell einsatzbereit" (Vertrag: bis erstes predict
+        // nach Warmup).
+        if (!inWarmup && modelLoadMsRef.current === null) {
+          modelLoadMsRef.current = performance.now() - loadStartRef.current;
+        }
 
         // FPS — gleitender Durchschnitt der letzten 30 Frames
         const now = performance.now();
@@ -481,6 +563,7 @@ export function usePoseDetection(
           inferenceMs,
           fps,
           frameIndex: frameCountRef.current,
+          timestampMs: t0,
           isWarmup: inWarmup,
         };
 
@@ -495,9 +578,11 @@ export function usePoseDetection(
           setMetrics((m) => ({ ...m, frameCount: frameCountRef.current }));
         }
 
-        return pose;
+        return { pose };
       } catch (err) {
-        // Sicherheitsnetz — Output disposen falls Fehler nach predict
+        // Sicherheitsnetz — Output disposen falls Fehler nach predict.
+        // predict-Bau/Tensor-Fehler -> Vertrag-Grund "predict_error"
+        // (Readback wird oben separat als "readback_error" behandelt).
         if (outputTensor) {
           try {
             outputTensor.dispose();
@@ -505,8 +590,11 @@ export function usePoseDetection(
             // ignore
           }
         }
+        const message = err instanceof Error ? err.message : String(err);
         console.error("Pose Detection Fehler:", err);
-        return null;
+        // Sichtbar ins UI: sonst bleiben Frames leer im Export ohne Hinweis
+        setError(`Inferenz-Fehler (${level}): ${message}`);
+        return { pose: null, reason: "predict_error", message };
       }
     },
     [detector],
@@ -525,6 +613,7 @@ export function usePoseDetection(
     currentLevel,
     isWarmingUp,
     lastMeasurementRef,
+    modelLoadMsRef,
     modelFingerprint,
     threadingPreference,
     setThreadingPreference,

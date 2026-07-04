@@ -9,6 +9,14 @@ interface QuantizationControlsProps {
   isWarmingUp: boolean;
   participantId: string;
   onParticipantIdChange: (id: string) => void;
+  /** 0-basierter Wiederholungs-Index (3 Läufe je Stufe×Threading). */
+  runIndex: number;
+  onRunIndexChange: (value: number) => void;
+  /** Hardware-Overrides für den Export (Browser liest CPU/Gerät nicht sauber). */
+  device: string;
+  onDeviceChange: (value: string) => void;
+  cpu: string;
+  onCpuChange: (value: string) => void;
   onExport: () => void;
 
   /** Side-Lock — Studienleiter setzt fest vor Messung. */
@@ -43,6 +51,12 @@ export function QuantizationControls({
   isWarmingUp,
   participantId,
   onParticipantIdChange,
+  runIndex,
+  onRunIndexChange,
+  device,
+  onDeviceChange,
+  cpu,
+  onCpuChange,
   onExport,
   forcedSide,
   onForcedSideChange,
@@ -179,6 +193,60 @@ export function QuantizationControls({
           disabled={disabled}
           className="w-full px-3 py-2 rounded-md bg-gray-900 border border-gray-700 text-sm text-gray-200 font-mono focus:outline-none focus:border-blue-500 disabled:opacity-50"
         />
+      </div>
+
+      {/* Wiederholungs-Index (0-basiert): 3 Läufe je Stufe×Threading */}
+      <div>
+        <label className="block text-xs text-gray-400 mb-1">
+          Lauf-Index (0-basiert)
+        </label>
+        <input
+          type="number"
+          min={0}
+          step={1}
+          value={runIndex}
+          onChange={(e) => onRunIndexChange(Number(e.target.value))}
+          disabled={disabled}
+          className="w-full px-3 py-2 rounded-md bg-gray-900 border border-gray-700 text-sm text-gray-200 font-mono focus:outline-none focus:border-blue-500 disabled:opacity-50"
+        />
+        <p className="text-xs text-gray-500 mt-1">
+          Zählt automatisch nach jeder Voll-Sequenz hoch (persistiert je
+          Proband×Threading).
+        </p>
+      </div>
+
+      {/* Hardware-Overrides — Browser liest CPU/Gerät nicht zuverlässig aus */}
+      <div className="grid grid-cols-1 gap-2">
+        <div>
+          <label className="block text-xs text-gray-400 mb-1">
+            Gerät (optional)
+          </label>
+          <input
+            type="text"
+            value={device}
+            onChange={(e) => onDeviceChange(e.target.value)}
+            placeholder='z.B. MacBook Pro 14" 2023'
+            disabled={disabled}
+            className="w-full px-3 py-2 rounded-md bg-gray-900 border border-gray-700 text-sm text-gray-200 focus:outline-none focus:border-blue-500 disabled:opacity-50"
+          />
+        </div>
+        <div>
+          <label className="block text-xs text-gray-400 mb-1">
+            CPU (optional)
+          </label>
+          <input
+            type="text"
+            value={cpu}
+            onChange={(e) => onCpuChange(e.target.value)}
+            placeholder="z.B. Apple M2 Pro, 10 cores"
+            disabled={disabled}
+            className="w-full px-3 py-2 rounded-md bg-gray-900 border border-gray-700 text-sm text-gray-200 focus:outline-none focus:border-blue-500 disabled:opacity-50"
+          />
+        </div>
+        <p className="text-xs text-gray-500">
+          Leer = Auto-Erkennung aus User-Agent. Für FF3 (Latenz) präzise Angabe
+          empfohlen.
+        </p>
       </div>
 
       {isWarmingUp && (

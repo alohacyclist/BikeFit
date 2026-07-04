@@ -1,7 +1,12 @@
 import { useRef, useEffect, useCallback, useState } from "react";
 import { SIDE_KEYPOINTS, type BodySide } from "../utils/AngleCalculator";
-import type { Pose } from "../hooks/usePoseDetection";
+import type { Pose, DetectResult } from "../hooks/usePoseDetection";
+import type { DroppedFrameReason } from "../services/BenchmarkExporter";
 import { useVideoSource } from "../hooks/useVideoSource";
+
+// Bricht einen Lauf hart ab, wenn zu viele Seek-Timeouts auftreten — dann ist
+// die Datei/Decoder kaputt und ein "Weiterlaufen mit Lücken" wäre sinnlos.
+const MAX_DROPPED_FRAMES = 15;
 
 const SKELETON_CONNECTIONS: [number, number][] = [
   [5, 6],
@@ -24,10 +29,17 @@ interface AnalysisViewProps {
   detectPose: (
     video: HTMLVideoElement,
     opts?: { record?: boolean },
-  ) => Promise<Pose | null>;
+  ) => Promise<DetectResult>;
   isDetectorReady: boolean;
   onCancel: () => void;
-  onFrameMeasurement?: (pose: Pose) => void;
+  /** Aufgezeichneter Frame i (0-basiert = Seek-Index). */
+  onFrameMeasurement?: (pose: Pose, frameIndex: number) => void;
+  /** Übersprungener Frame (Seek-Timeout / predict-Fehler) — Vertrag droppedFrames. */
+  onDroppedFrame?: (
+    frameIndex: number,
+    reason: DroppedFrameReason,
+    message?: string,
+  ) => void;
   onSideLocked?: (side: BodySide) => void;
   onRecordingFinalize?: (
     durationSeconds: number,
@@ -52,6 +64,13 @@ interface AnalysisViewProps {
    * Voll-Sequenz-Orchestrierung in App.tsx.
    */
   autoStartTrigger?: number;
+  /**
+   * True während einer laufenden Voll-Sequenz. Unterdrückt Setup-Preview
+   * und Phase-Reset-nach-Complete zwischen Stufen — sonst konkurriert das
+   * Preview mit dem sofort folgenden Recording-Loop um <video>.currentTime
+   * (Seek-Race).
+   */
+  inSequence?: boolean;
 }
 
 /**
@@ -97,6 +116,7 @@ export function AnalysisView({
   isDetectorReady,
   onCancel,
   onFrameMeasurement,
+  onDroppedFrame,
   onSideLocked,
   onRecordingFinalize,
   onRecordingStart,
@@ -106,10 +126,12 @@ export function AnalysisView({
   forcedSide,
   targetFps,
   autoStartTrigger,
+  inSequence = false,
 }: AnalysisViewProps) {
   const videoRef = useRef<HTMLVideoElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const onFrameRef = useRef(onFrameMeasurement);
+  const onDroppedRef = useRef(onDroppedFrame);
   const lastAutoTriggerRef = useRef<number>(0);
 
   const [phase, setPhase] = useState<AnalysisPhase>("setup");
@@ -126,7 +148,8 @@ export function AnalysisView({
 
   useEffect(() => {
     onFrameRef.current = onFrameMeasurement;
-  }, [onFrameMeasurement]);
+    onDroppedRef.current = onDroppedFrame;
+  }, [onFrameMeasurement, onDroppedFrame]);
 
   // Datei-Quelle an das <video>-Element binden.
   const sourceState = useVideoSource(videoRef, {
@@ -183,18 +206,39 @@ export function AnalysisView({
     setPhase("recording");
   }, [forcedSide, onSideLocked, onRecordingActiveChange]);
 
+  // Nach einer erfolgreichen Aufnahme steht phase auf "complete". Sobald ein
+  // NEUES Modell geladen ist (Level-Wechsel manuell oder via Voll-Sequenz),
+  // muss AnalysisView wieder in "setup", damit
+  //   (a) das Start-Panel im UI sichtbar wird und
+  //   (b) der autoStartTrigger-Effect eine neue Aufnahme starten kann.
+  useEffect(() => {
+    // Bei aktiver Voll-Sequenz NICHT nach setup zurück — sonst feuert
+    // Setup-Preview zwischen den Stufen einen Seek(0), der mit dem sofort
+    // folgenden Recording-Loop um <video>.currentTime konkurriert (Race).
+    // autoStartTrigger kann aus "complete" direkt nach "recording" gehen.
+    if (inSequence) return;
+    if (isDetectorReady && phase === "complete") {
+      setPhase("setup");
+    }
+  }, [isDetectorReady, phase, inSequence]);
+
   // Voll-Sequenz-Hook: Wenn der Parent autoStartTrigger inkrementiert (und wir
-  // in Setup + bereit sind), startet eine neue Aufnahme automatisch.
+  // NICHT gerade aufnehmen + Detector/Datei bereit), startet eine neue
+  // Aufnahme automatisch. Erlaubt Start aus "setup" UND aus "complete" —
+  // startRecording() setzt phase intern auf "recording".
   useEffect(() => {
     if (!autoStartTrigger || autoStartTrigger === lastAutoTriggerRef.current)
       return;
-    lastAutoTriggerRef.current = autoStartTrigger;
+    // Trigger erst KONSUMIEREN, wenn wirklich alles bereit ist — sonst ginge er
+    // verloren, während die (nach Reload aus IndexedDB restaurierte) Videoquelle
+    // noch lädt, und die Voll-Sequenz bliebe stehen.
     if (
-      phase === "setup" &&
+      phase !== "recording" &&
       isDetectorReady &&
       videoFile &&
       sourceState.isReady
     ) {
+      lastAutoTriggerRef.current = autoStartTrigger;
       startRecording();
     }
   }, [
@@ -222,7 +266,10 @@ export function AnalysisView({
   }, [onRecordingActiveChange, onRecordingAbort]);
 
   // Setup-Preview: ersten Frame mit Skeleton zeigen + Sichtbarkeit je Seite.
+  // Während einer Voll-Sequenz überspringen — das Preview würde mit dem
+  // nächsten Recording-Loop um <video>.currentTime konkurrieren.
   useEffect(() => {
+    if (inSequence) return;
     if (!isDetectorReady || phase !== "setup" || !sourceState.isReady) return;
     let cancelled = false;
 
@@ -232,7 +279,7 @@ export function AnalysisView({
       if (!video || !canvas) return;
       await seekTo(video, 0);
       if (cancelled) return;
-      const pose = await detectPose(video, { record: false });
+      const { pose } = await detectPose(video, { record: false });
       if (cancelled) return;
       const ctx = canvas.getContext("2d");
       if (!ctx) return;
@@ -261,7 +308,14 @@ export function AnalysisView({
     return () => {
       cancelled = true;
     };
-  }, [isDetectorReady, phase, sourceState.isReady, detectPose, drawSkeleton]);
+  }, [
+    isDetectorReady,
+    phase,
+    sourceState.isReady,
+    detectPose,
+    drawSkeleton,
+    inSequence,
+  ]);
 
   // Recording-Loop: deterministisches Frame-für-Frame-Stepping.
   // Verarbeitet EXAKT floor(duration * targetFps) Frames — identischer
@@ -311,25 +365,52 @@ export function AnalysisView({
         return;
       }
 
+      // Übersprungene Frames protokollieren statt still fallen zu lassen —
+      // Vertrag: droppedFrames[], Invariante videoTotalFrames == frames+dropped.
+      let droppedCount = 0;
+      const registerDrop = (
+        idx: number,
+        reason: DroppedFrameReason,
+        msg: string,
+      ) => {
+        onDroppedRef.current?.(idx, reason, msg);
+        droppedCount += 1;
+      };
+
       for (let i = 0; i < total && !cancelled; i++) {
         // Frame-Mitte ansteuern, robust gegen Rundung an Frame-Grenzen.
         const ok = await seekTo(video, (i + 0.5) / targetFps);
         if (cancelled) return;
         if (!ok) {
-          // Seek-Timeout/Decode-Fehler → kein stiller Falschframe, hart abbrechen.
-          abort(`Seek auf Frame ${i} fehlgeschlagen — Aufnahme abgebrochen.`);
-          return;
+          // Seek-Timeout/Decode-Fehler: Frame i als dropped verbuchen und
+          // weiterlaufen (kein stiller Falschframe, aber auch kein Voll-Abbruch).
+          registerDrop(i, "seek_timeout", "Seek-Timeout/Decode-Fehler");
+        } else {
+          const result = await detectPose(video);
+          if (cancelled) return;
+
+          ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+
+          if (result.pose) {
+            // Reiner Datensammler: Pose + Frame-Index i an Parent für Export,
+            // Skeleton-Render. Winkel/Statistik im Python-Postprocessing.
+            onFrameRef.current?.(result.pose, i);
+            drawSkeleton(ctx, result.pose.keypoints);
+          } else {
+            // predict/Readback-Fehler → mit Vertrag-Grund protokollieren.
+            registerDrop(
+              i,
+              result.reason ?? "predict_error",
+              result.message ?? "detectPose lieferte null",
+            );
+          }
         }
-        const pose = await detectPose(video);
-        if (cancelled) return;
 
-        ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
-
-        if (pose) {
-          // Reiner Datensammler: Pose an Parent für Export, Skeleton-Render.
-          // Winkelberechnung/Statistik passiert im Python-Postprocessing.
-          onFrameRef.current?.(pose);
-          drawSkeleton(ctx, pose.keypoints);
+        if (droppedCount > MAX_DROPPED_FRAMES) {
+          abort(
+            `Zu viele fehlerhafte Frames (${droppedCount}) — Aufnahme abgebrochen.`,
+          );
+          return;
         }
 
         setVideoProgress((i + 1) / total);
