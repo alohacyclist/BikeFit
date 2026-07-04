@@ -1,87 +1,270 @@
-import { useState, useCallback, useEffect } from "react";
+import { useState, useCallback, useEffect, useRef } from "react";
 import { usePoseDetection, type Pose } from "./hooks/usePoseDetection";
 import { AnalysisView } from "./components/AnalysisView";
 import { QuantizationControls } from "./components/QuantizationControls";
 import { VideoSourcePanel } from "./components/VideoSourcePanel";
-import { benchmarkExporter } from "./services/BenchmarkExporter";
+import {
+  benchmarkExporter,
+  type DroppedFrameReason,
+} from "./services/BenchmarkExporter";
 import { calculateKneeAngle, type BodySide } from "./utils/AngleCalculator";
-import { KP, type QuantizationLevel } from "./types/quantization";
+import { detectHardware } from "./utils/hardwareInfo";
+import * as videoStore from "./utils/videoStore";
+import {
+  readPending,
+  writePending,
+  clearPending,
+  type PendingBoot,
+} from "./utils/sequenceResume";
+import {
+  KP,
+  TFLITE_MODEL_URLS,
+  type QuantizationLevel,
+} from "./types/quantization";
+
+const HW_DEVICE_KEY = "edgefit.hw.device";
+const HW_CPU_KEY = "edgefit.hw.cpu";
+const PID_KEY = "edgefit.probandId";
+const SIDE_KEY = "edgefit.bodySide";
+const FPS_KEY = "edgefit.targetFps";
+
+// Ganze Sequenz. Der Wechsel INS/AUS int8 deadlockt bei In-Page-Modellwechsel
+// (qu8-Delegate-Swap auf dem page-lifetime-Singleton-Pthread-Pool). Deshalb
+// läuft JEDER Stufenwechsel über einen Reload → frischer Pool, kein Swap.
+const SEQUENCE_ORDER: QuantizationLevel[] = ["fp32", "fp16", "int8"];
+
+const delay = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 function App() {
+  // Beim Boot ausstehenden Stufen-/Sequenz-Zustand EINMAL lesen — bestimmt die
+  // initial zu ladende Stufe (statt immer fp32) und ob automatisch aufgenommen
+  // wird (Voll-Sequenz-Resume).
+  const bootRef = useRef<PendingBoot | null>(readPending());
+  const boot = bootRef.current;
+  const initialLevel: QuantizationLevel = boot?.level ?? "fp32";
+
   const {
     metrics,
     isLoading,
     error,
     detectPose,
     detector,
-    loadModel,
-    resetBackend,
     beginWarmup,
     currentLevel,
     isWarmingUp,
     lastMeasurementRef,
+    modelLoadMsRef,
     modelFingerprint,
     threadingPreference,
     setThreadingPreference,
     multiThreadingAvailable,
     activeThreadingMode,
-    activeNumThreads,
-  } = usePoseDetection("fp32");
+  } = usePoseDetection(initialLevel);
 
-  const [participantId, setParticipantId] = useState("P01");
+  const [participantId, setParticipantId] = useState(
+    () => localStorage.getItem(PID_KEY) ?? "P01",
+  );
   const [videoFile, setVideoFile] = useState<File | null>(null);
-  const [targetFps, setTargetFps] = useState(30);
-  const [forcedSide, setForcedSide] = useState<BodySide>("right");
+  const [targetFps, setTargetFps] = useState(
+    () => Number(localStorage.getItem(FPS_KEY)) || 30,
+  );
+  const [forcedSide, setForcedSide] = useState<BodySide>(() =>
+    localStorage.getItem(SIDE_KEY) === "right" ? "right" : "left",
+  );
   const [isRecording, setIsRecording] = useState(false);
+  const [runIndex, setRunIndex] = useState(0);
+  const [device, setDevice] = useState(
+    () => localStorage.getItem(HW_DEVICE_KEY) ?? "",
+  );
+  const [cpu, setCpu] = useState(() => localStorage.getItem(HW_CPU_KEY) ?? "");
   const [lastSummary, setLastSummary] = useState<{
     durationSeconds: number;
     expectedFrames: number;
   } | null>(null);
+  // In IndexedDB gesammelte Sequenz-JSONs, die auf einen gestenbasierten
+  // Download warten (Auto-Download nach Reload wird von Chrome blockiert).
+  const [pendingResults, setPendingResults] = useState<
+    videoStore.StoredResult[]
+  >([]);
 
-  // Voll-Sequenz: automatisches Durchlaufen aller drei Quantisierungsstufen
-  // mit demselben Video + denselben Lock-Parametern (Side, Threading).
-  // `sequenceQueue` enthält die noch ausstehenden Stufen; `autoStartTrigger`
-  // ist ein Zähler, dessen Inkrement an AnalysisView signalisiert "jetzt starten".
-  const [sequenceQueue, setSequenceQueue] = useState<QuantizationLevel[]>([]);
+  // Voll-Sequenz-Zustand (überlebt Reloads via sessionStorage/IndexedDB).
+  const [sequenceActive, setSequenceActive] = useState<boolean>(
+    boot?.autoRecord ?? false,
+  );
+  const remainingRef = useRef<QuantizationLevel[]>(boot?.remaining ?? []);
   const [autoStartTrigger, setAutoStartTrigger] = useState(0);
-  const SEQUENCE_ORDER: QuantizationLevel[] = ["fp32", "fp16", "int8"];
+  const autoStartedRef = useRef(false);
 
-  // Session bei Detektor-Ready / Level- / Side-Wechsel neu starten
+  // --- Persistente Setup-Setter (überleben Reload via localStorage) ---
+  const persist = (key: string, value: string) => {
+    try {
+      localStorage.setItem(key, value);
+    } catch {
+      // ignore
+    }
+  };
+  const changeParticipantId = useCallback((v: string) => {
+    setParticipantId(v);
+    persist(PID_KEY, v);
+  }, []);
+  const changeForcedSide = useCallback((v: BodySide) => {
+    setForcedSide(v);
+    persist(SIDE_KEY, v);
+  }, []);
+  const changeTargetFps = useCallback((v: number) => {
+    setTargetFps(v);
+    persist(FPS_KEY, String(v));
+  }, []);
+  const changeDevice = useCallback((v: string) => {
+    setDevice(v);
+    persist(HW_DEVICE_KEY, v);
+  }, []);
+  const changeCpu = useCallback((v: string) => {
+    setCpu(v);
+    persist(HW_CPU_KEY, v);
+  }, []);
+
+  // runIndex je (Proband × Threading) persistieren.
+  const runKey = `edgefit.runIndex.${participantId}.${threadingPreference}`;
+  const runKeyRef = useRef(runKey);
+  useEffect(() => {
+    runKeyRef.current = runKey;
+  }, [runKey]);
+  useEffect(() => {
+    try {
+      const stored = localStorage.getItem(runKey);
+      setRunIndex(stored !== null ? Number(stored) || 0 : 0);
+    } catch {
+      setRunIndex(0);
+    }
+  }, [runKey]);
+  const setRunIndexPersist = useCallback((value: number) => {
+    const v = Number.isFinite(value) && value >= 0 ? Math.floor(value) : 0;
+    setRunIndex(v);
+    persist(runKeyRef.current, String(v));
+  }, []);
+  const bumpRunIndex = useCallback(() => {
+    setRunIndex((r) => {
+      const next = r + 1;
+      persist(runKeyRef.current, String(next));
+      return next;
+    });
+  }, []);
+
+  // --- Boot-Resume: Video wiederherstellen, Pending konsumieren ---
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      if (boot) {
+        // Video aus IndexedDB zurückholen (Reload verwarf das File-Objekt).
+        try {
+          const file = await videoStore.loadVideo();
+          if (!cancelled && file) setVideoFile(file);
+        } catch {
+          // ignore
+        }
+        // Einzelwechsel (kein autoRecord): Pending ist Einmal-Direktive.
+        if (!boot.autoRecord) clearPending();
+      } else {
+        // Frischer Start: evtl. Alt-Video aus einer früheren Sitzung verwerfen.
+        try {
+          await videoStore.clearVideo();
+        } catch {
+          // ignore
+        }
+      }
+      // Nicht mitten in einer Sequenz: evtl. noch nicht heruntergeladene
+      // Ergebnis-JSONs anbieten (überleben Reload/Tab-Schließen in IndexedDB).
+      if (!boot?.autoRecord) {
+        try {
+          const results = await videoStore.loadResults();
+          if (!cancelled && results.length) setPendingResults(results);
+        } catch {
+          // ignore
+        }
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // Zentrale Session-Initialisierung nach Vertrag v1.0.0.
+  const initSession = useCallback(() => {
+    benchmarkExporter.reset();
+    benchmarkExporter.startSession(participantId, currentLevel, runIndex);
+    benchmarkExporter.setBodySide(forcedSide);
+    benchmarkExporter.setThreading(
+      activeThreadingMode === "multi" ? "multi" : "single",
+    );
+    benchmarkExporter.setModel(
+      modelFingerprint?.sha256 ?? "",
+      modelFingerprint?.url ?? TFLITE_MODEL_URLS[currentLevel],
+    );
+    benchmarkExporter.setTargetFps(targetFps);
+    const hw = detectHardware();
+    benchmarkExporter.setHardware({
+      ...hw,
+      device: device.trim() || hw.device,
+      cpu: cpu.trim() || hw.cpu,
+    });
+  }, [
+    participantId,
+    currentLevel,
+    runIndex,
+    forcedSide,
+    activeThreadingMode,
+    modelFingerprint,
+    targetFps,
+    device,
+    cpu,
+  ]);
+
   useEffect(() => {
     if (!detector) return;
-    benchmarkExporter.reset();
-    benchmarkExporter.startSession(participantId, currentLevel);
-    benchmarkExporter.setLockedSide(forcedSide);
-    benchmarkExporter.setModelFingerprint(modelFingerprint);
-    benchmarkExporter.setThreadingMode(activeThreadingMode);
-    benchmarkExporter.setNumThreads(activeNumThreads);
-    benchmarkExporter.setVideoSource(videoFile?.name, targetFps);
-  }, [
-    detector,
-    currentLevel,
-    participantId,
-    forcedSide,
-    modelFingerprint,
-    activeThreadingMode,
-    activeNumThreads,
-    targetFps,
-    videoFile,
-  ]);
+    initSession();
+  }, [detector, initSession]);
+
+  // Auto-Aufnahme im Sequenz-Boot: einmal triggern, sobald Modell bereit.
+  // AnalysisView startet dann, sobald zusätzlich die Videoquelle bereit ist.
+  useEffect(() => {
+    if (!sequenceActive || autoStartedRef.current) return;
+    if (detector && !isLoading && !isWarmingUp) {
+      autoStartedRef.current = true;
+      setAutoStartTrigger((n) => n + 1);
+    }
+  }, [sequenceActive, detector, isLoading, isWarmingUp]);
+
+  // --- Reload-getriebener Stufenwechsel (frischer Pthread-Pool) ---
+  const goToLevel = useCallback(
+    async (
+      level: QuantizationLevel,
+      remaining: QuantizationLevel[],
+      autoRecord: boolean,
+    ) => {
+      // Video über den Reload retten.
+      try {
+        if (videoFile) await videoStore.saveVideo(videoFile);
+      } catch {
+        // ignore — ohne Video kann eine Sequenz nicht fortsetzen
+      }
+      writePending({ level, remaining, autoRecord });
+      window.location.reload();
+    },
+    [videoFile],
+  );
 
   const handleLevelChange = useCallback(
     async (level: QuantizationLevel) => {
-      if (level === currentLevel) return;
-      await resetBackend();
-      await loadModel(level);
+      if (level === currentLevel || isRecording) return;
+      await goToLevel(level, [], false);
     },
-    [currentLevel, resetBackend, loadModel],
+    [currentLevel, isRecording, goToLevel],
   );
 
   const handleThreadingChange = useCallback(
     (mode: "single" | "multi") => {
-      // setThreadingPreference persistiert in sessionStorage und triggert
-      // window.location.reload() — TFLite-UMD ist Page-Singleton, Hot-Swap
-      // des Pthread-Pools würde deadlocken.
       setThreadingPreference(mode);
     },
     [setThreadingPreference],
@@ -92,59 +275,100 @@ function App() {
   }, []);
 
   const handleSideLocked = useCallback((side: BodySide) => {
-    benchmarkExporter.setLockedSide(side);
+    benchmarkExporter.setBodySide(side);
   }, []);
 
+  const handleRunFullSequence = useCallback(async () => {
+    if (!videoFile || isRecording) return;
+    // Ergebnisse einer früheren Sequenz verwerfen, damit nichts vermischt wird.
+    try {
+      await videoStore.clearResults();
+    } catch {
+      // ignore
+    }
+    setPendingResults([]);
+    const [first, ...rest] = SEQUENCE_ORDER;
+    // Sequenz startet mit einem Reload auf die erste Stufe (frischer Pool),
+    // autoRecord treibt danach jede Stufe über Reloads hinweg.
+    await goToLevel(first, rest, true);
+  }, [videoFile, isRecording, goToLevel]);
+
+  // Alle gesammelten Sequenz-JSONs mit EINER User-Geste herunterladen (umgeht
+  // Chromes Blockade automatischer Downloads nach Reload).
+  const downloadResults = useCallback(() => {
+    for (const r of pendingResults) {
+      const blob = new Blob([r.json], { type: "application/json" });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = r.filename;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      setTimeout(() => URL.revokeObjectURL(url), 2000);
+    }
+    videoStore.clearResults().catch(() => {});
+    setPendingResults([]);
+  }, [pendingResults]);
+
   const handleRecordingFinalize = useCallback(
-    (durationSeconds: number, expectedFrames: number) => {
-      benchmarkExporter.setVideoMeta(durationSeconds, expectedFrames);
-      // Auto-Export: Session-Daten werden beim nächsten Setting-Wechsel
-      // (Quantisierung/Threading/Datei/ID) zurückgesetzt — daher sofort
-      // herunterladen, sobald die Aufnahme sauber durchgelaufen ist.
-      // Abgebrochene Aufnahmen rufen diesen Pfad NICHT, sondern onRecordingAbort.
-      benchmarkExporter.downloadJSON();
-      setLastSummary({ durationSeconds, expectedFrames });
-      // Voll-Sequenz: aktuelle Stufe abhaken; Drive-Effect lädt die nächste.
-      setSequenceQueue((q) => q.slice(1));
+    async (durationSeconds: number, totalFrames: number) => {
+      benchmarkExporter.setVideoMeta(durationSeconds, totalFrames);
+      benchmarkExporter.setModelLoadMs(modelLoadMsRef.current ?? 0);
+      setLastSummary({ durationSeconds, expectedFrames: totalFrames });
+
+      if (!sequenceActive) {
+        // Einzelaufnahme: kein Reload dazwischen → Auto-Download hängt an der
+        // Start-Geste und funktioniert.
+        benchmarkExporter.downloadJSON();
+        return;
+      }
+
+      // Voll-Sequenz: NICHT automatisch herunterladen. Nach jedem Reload wäre
+      // der Download un-gestured → Chrome blockt ihn (nur die erste Stufe käme
+      // durch). Stattdessen JSON in IndexedDB sammeln und am Ende per Button
+      // (User-Geste) alle gemeinsam herunterladen.
+      try {
+        await videoStore.saveResult(
+          currentLevel,
+          benchmarkExporter.getFilename(),
+          benchmarkExporter.exportJSON(),
+        );
+      } catch {
+        // ignore
+      }
+
+      const remaining = remainingRef.current;
+      if (remaining.length > 0) {
+        const [next, ...rest] = remaining;
+        await delay(300);
+        await goToLevel(next, rest, true);
+      } else {
+        // Sequenz komplett: runIndex erhöhen, gesammelte JSONs zum Download
+        // anbieten.
+        bumpRunIndex();
+        remainingRef.current = [];
+        setSequenceActive(false);
+        clearPending();
+        try {
+          setPendingResults(await videoStore.loadResults());
+        } catch {
+          // ignore
+        }
+      }
+    },
+    [sequenceActive, currentLevel, goToLevel, bumpRunIndex, modelLoadMsRef],
+  );
+
+  const handleDroppedFrame = useCallback(
+    (frameIndex: number, reason: DroppedFrameReason, message?: string) => {
+      benchmarkExporter.recordDropped({ frameIndex, reason, message });
     },
     [],
   );
 
-  const handleRunFullSequence = useCallback(() => {
-    if (!videoFile || !detector || isRecording) return;
-    setSequenceQueue([...SEQUENCE_ORDER]);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [videoFile, detector, isRecording]);
-
-  // Drive-Effect: führt die Sequenz schrittweise aus
-  //   1. Wenn aktuelles Level nicht dem Queue-Kopf entspricht: Modell wechseln.
-  //   2. Wenn Detector bereit, kein Recording läuft: autoStartTrigger inkrementieren
-  //      → AnalysisView startet eine neue Aufnahme.
-  useEffect(() => {
-    if (sequenceQueue.length === 0) return;
-    if (!detector || isLoading || isWarmingUp || isRecording) return;
-    const nextLevel = sequenceQueue[0];
-    if (currentLevel !== nextLevel) {
-      void (async () => {
-        await resetBackend();
-        await loadModel(nextLevel);
-      })();
-      return;
-    }
-    setAutoStartTrigger((n) => n + 1);
-  }, [
-    sequenceQueue,
-    detector,
-    isLoading,
-    isWarmingUp,
-    isRecording,
-    currentLevel,
-    resetBackend,
-    loadModel,
-  ]);
-
   const handleFrameMeasurement = useCallback(
-    (pose: Pose) => {
+    (pose: Pose, frameIndex: number) => {
       const m = lastMeasurementRef.current;
       if (!m) return;
       const kp = pose.keypoints;
@@ -159,12 +383,13 @@ function App() {
         kp[KP.LEFT_ANKLE],
       );
       benchmarkExporter.recordFrame({
-        frameIndex: m.frameIndex,
-        timestampMs: performance.now(),
+        frameIndex,
+        timestampMs: m.timestampMs,
         inferenceMs: m.inferenceMs,
-        fps: m.fps,
+        fps: m.inferenceMs > 0 ? 1000 / m.inferenceMs : 0,
         kneeAngleRight: kneeRight,
         kneeAngleLeft: kneeLeft,
+        keypoints: kp.map((k) => ({ x: k.x, y: k.y })),
         keypointScores: kp.map((k) => k.score ?? 0),
         isWarmup: m.isWarmup,
       });
@@ -173,26 +398,13 @@ function App() {
   );
 
   const handleResetSession = useCallback(() => {
-    // Abbruch beendet auch eine laufende Voll-Sequenz — keine Teil-Sequenz.
-    setSequenceQueue([]);
+    // Abbruch beendet auch eine laufende Voll-Sequenz.
+    setSequenceActive(false);
+    remainingRef.current = [];
+    clearPending();
     setLastSummary(null);
-    benchmarkExporter.reset();
-    benchmarkExporter.startSession(participantId, currentLevel);
-    benchmarkExporter.setLockedSide(forcedSide);
-    benchmarkExporter.setModelFingerprint(modelFingerprint);
-    benchmarkExporter.setThreadingMode(activeThreadingMode);
-    benchmarkExporter.setNumThreads(activeNumThreads);
-    benchmarkExporter.setVideoSource(videoFile?.name, targetFps);
-  }, [
-    participantId,
-    currentLevel,
-    forcedSide,
-    modelFingerprint,
-    activeThreadingMode,
-    activeNumThreads,
-    targetFps,
-    videoFile,
-  ]);
+    initSession();
+  }, [initSession]);
 
   return (
     <div className="min-h-screen bg-gradient-to-br from-gray-900 via-gray-800 to-gray-900">
@@ -242,6 +454,7 @@ function App() {
             isDetectorReady={!isLoading && detector !== null}
             onCancel={handleResetSession}
             onFrameMeasurement={handleFrameMeasurement}
+            onDroppedFrame={handleDroppedFrame}
             onSideLocked={handleSideLocked}
             onRecordingFinalize={handleRecordingFinalize}
             onRecordingStart={beginWarmup}
@@ -251,6 +464,7 @@ function App() {
             forcedSide={forcedSide}
             targetFps={targetFps}
             autoStartTrigger={autoStartTrigger}
+            inSequence={sequenceActive}
           />
 
           <div className="space-y-4">
@@ -258,7 +472,7 @@ function App() {
               file={videoFile}
               onFileChange={setVideoFile}
               targetFps={targetFps}
-              onTargetFpsChange={setTargetFps}
+              onTargetFpsChange={changeTargetFps}
               disabled={isRecording}
             />
 
@@ -268,10 +482,16 @@ function App() {
               isLoading={isLoading}
               isWarmingUp={isWarmingUp}
               participantId={participantId}
-              onParticipantIdChange={setParticipantId}
+              onParticipantIdChange={changeParticipantId}
+              runIndex={runIndex}
+              onRunIndexChange={setRunIndexPersist}
+              device={device}
+              onDeviceChange={changeDevice}
+              cpu={cpu}
+              onCpuChange={changeCpu}
               onExport={handleExport}
               forcedSide={forcedSide}
-              onForcedSideChange={setForcedSide}
+              onForcedSideChange={changeForcedSide}
               threadingPreference={threadingPreference}
               onThreadingPreferenceChange={handleThreadingChange}
               multiThreadingAvailable={multiThreadingAvailable}
@@ -279,14 +499,16 @@ function App() {
               recording={isRecording}
               onRunFullSequence={handleRunFullSequence}
               sequenceTotal={SEQUENCE_ORDER.length}
-              sequenceRemaining={sequenceQueue.length}
+              sequenceRemaining={
+                sequenceActive ? remainingRef.current.length + 1 : 0
+              }
               canStartSequence={
                 !!videoFile &&
                 !!detector &&
                 !isLoading &&
                 !isWarmingUp &&
                 !isRecording &&
-                sequenceQueue.length === 0
+                !sequenceActive
               }
             />
 
@@ -326,6 +548,33 @@ function App() {
                 </div>
               )}
             </div>
+
+            {sequenceActive && (
+              <div className="bg-blue-900/30 rounded-lg p-3 border border-blue-700/40 text-xs text-blue-200">
+                Voll-Sequenz läuft ({currentLevel.toUpperCase()}) — nach jeder
+                Stufe lädt die App per Reload neu (frischer WASM-Pool). Die
+                JSONs werden gesammelt und am Ende auf Klick heruntergeladen.
+              </div>
+            )}
+
+            {pendingResults.length > 0 && !sequenceActive && (
+              <div className="bg-green-900/30 rounded-lg p-4 border border-green-600/50 space-y-2">
+                <div className="text-sm font-semibold text-green-300">
+                  Sequenz fertig — {pendingResults.length} JSON bereit
+                </div>
+                <p className="text-[11px] text-gray-300 leading-snug">
+                  {pendingResults.map((r) => r.level).join(", ")}. Ein Klick
+                  lädt alle. Chrome fragt evtl. „mehrere Dateien herunterladen?"
+                  → Zulassen.
+                </p>
+                <button
+                  onClick={downloadResults}
+                  className="w-full py-2.5 px-3 rounded-md text-sm font-bold bg-green-500 hover:bg-green-600 text-white"
+                >
+                  {pendingResults.length} JSON herunterladen
+                </button>
+              </div>
+            )}
 
             {lastSummary && (
               <div className="bg-gray-800/50 rounded-lg p-4 border border-green-700/40 text-xs space-y-1">

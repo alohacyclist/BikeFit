@@ -1,135 +1,143 @@
 /**
  * BenchmarkExporter — sammelt Messdaten pro Frame und exportiert sie als JSON
- * für Postprocessing in Python (NumPy / pandas / SciPy).
+ * nach dem Vertrag v1.0.0 (siehe scripts/postprocess_benchmark.py).
+ *
+ * Reiner Datensammler: keine App-seitige Confidence-Filterung, keine
+ * Statistik. Winkel werden pro Frame roh mitgeschrieben; Selektion,
+ * Ausreißerfilter und Aggregation passieren ausschließlich im
+ * Python-Postprocessing.
  */
 
-import { QuantizationLevel } from "../types/quantization";
+import { QuantizationLevel, WARMUP_FRAMES } from "../types/quantization";
 import type { BodySide } from "../utils/AngleCalculator";
-import type { ModelFingerprint } from "../utils/modelFingerprint";
+import { detectHardware, toCompactTimestamp } from "../utils/hardwareInfo";
+import type { HardwareInfo } from "../utils/hardwareInfo";
+
+export const SCHEMA_VERSION = "1.0.0" as const;
+
+export interface Point2D {
+  x: number;
+  y: number;
+}
 
 export interface FrameMeasurement {
+  /** 0-basiert, entspricht i in seekTo((i+0.5)/targetFps). */
   frameIndex: number;
+  /** performance.now() VOR predict. */
   timestampMs: number;
+  /** predict + Readback (data()). */
   inferenceMs: number;
+  /** 1000/inferenceMs, nur informativ. */
   fps: number;
-  /**
-   * Roh-Kniewinkel — kein App-seitiger Confidence-Filter. Selektion erfolgt
-   * im Python-Postprocessing anhand der `keypointScores` mit dort
-   * dokumentierter Schwelle (Sensitivity-Sweep).
-   */
   kneeAngleRight: number;
   kneeAngleLeft: number;
+  /** Länge 17, COCO-Reihenfolge. */
+  keypoints: Point2D[];
+  /** Länge 17, [0..1]. */
   keypointScores: number[];
   isWarmup: boolean;
 }
 
-interface SystemInfo {
-  userAgent: string;
-  hardwareConcurrency: number;
-  deviceMemory?: number;
-  /** Vom Browser gemeldete Cross-Origin-Isolation (Voraussetzung für SAB). */
-  crossOriginIsolated: boolean;
-  /** Ob SharedArrayBuffer im aktuellen Kontext definiert ist. */
-  sharedArrayBufferAvailable: boolean;
+export type DroppedFrameReason =
+  "seek_timeout" | "predict_error" | "readback_error" | "other";
+
+export interface DroppedFrame {
+  frameIndex: number;
+  reason: DroppedFrameReason;
+  message?: string;
 }
 
 export interface BenchmarkSession {
-  participantId: string;
-  quantizationLevel: QuantizationLevel;
-  startTimestamp: string;
-  systemInfo: SystemInfo;
-  warmupFrames: number;
-  lockedSide: BodySide | null; // welche Körperseite getrackt wurde
-  modelFingerprint: ModelFingerprint | null;
-  threadingMode: "single" | "multi" | "unknown";
-  /** Tatsächlich an TFLite übergebener numThreads-Parameter. */
-  numThreads: number | null;
-  videoSource: "file";
-  videoSourceName?: string;
-  /** Ziel-Framerate des deterministischen Replay-Steppings (CFR-Annahme). */
+  schemaVersion: typeof SCHEMA_VERSION;
+  probandId: string;
+  level: QuantizationLevel;
+  runIndex: number;
+  createdAt: string;
   targetFps: number;
-  /** Länge des Quell-Videos in Sekunden (0 bis Aufnahme finalisiert). */
-  durationSeconds: number;
-  /** Erwartete Frame-Anzahl = floor(durationSeconds * targetFps). */
-  expectedFrames: number;
+  bodySide: BodySide;
+  threading: "single" | "multi";
+  videoDurationSec: number;
+  videoTotalFrames: number;
+  warmupCount: number;
+  modelFingerprintSha256: string;
+  modelUrl: string;
+  modelLoadMs: number;
+  userAgent: string;
+  hardware: HardwareInfo;
   frames: FrameMeasurement[];
-}
-
-import { WARMUP_FRAMES } from "../types/quantization";
-
-function collectSystemInfo(): SystemInfo {
-  const navAny = navigator as Navigator & { deviceMemory?: number };
-  const coi =
-    typeof self !== "undefined" &&
-    (self as unknown as { crossOriginIsolated?: boolean })
-      .crossOriginIsolated === true;
-  return {
-    userAgent: navigator.userAgent,
-    hardwareConcurrency: navigator.hardwareConcurrency ?? 0,
-    deviceMemory: navAny.deviceMemory,
-    crossOriginIsolated: coi,
-    sharedArrayBufferAvailable: typeof SharedArrayBuffer !== "undefined",
-  };
+  droppedFrames: DroppedFrame[];
 }
 
 export class BenchmarkExporter {
   private session: BenchmarkSession | null = null;
 
-  startSession(participantId: string, level: QuantizationLevel): void {
+  startSession(
+    probandId: string,
+    level: QuantizationLevel,
+    runIndex: number,
+  ): void {
     this.session = {
-      participantId,
-      quantizationLevel: level,
-      startTimestamp: new Date().toISOString(),
-      systemInfo: collectSystemInfo(),
-      warmupFrames: WARMUP_FRAMES,
-      lockedSide: null,
-      modelFingerprint: null,
-      threadingMode: "unknown",
-      numThreads: null,
-      videoSource: "file",
-      targetFps: 0,
-      durationSeconds: 0,
-      expectedFrames: 0,
+      schemaVersion: SCHEMA_VERSION,
+      probandId,
+      level,
+      runIndex,
+      createdAt: new Date().toISOString(),
+      targetFps: 30,
+      bodySide: "left",
+      threading: "single",
+      videoDurationSec: 0,
+      videoTotalFrames: 0,
+      warmupCount: WARMUP_FRAMES,
+      modelFingerprintSha256: "",
+      modelUrl: "",
+      modelLoadMs: 0,
+      userAgent:
+        typeof navigator !== "undefined" ? navigator.userAgent : "unknown",
+      hardware: detectHardware(),
       frames: [],
+      droppedFrames: [],
     };
   }
 
-  setNumThreads(n: number | null): void {
-    if (!this.session) return;
-    this.session.numThreads = n;
+  setBodySide(side: BodySide): void {
+    if (this.session) this.session.bodySide = side;
   }
 
-  setLockedSide(side: BodySide): void {
-    if (!this.session) return;
-    this.session.lockedSide = side;
+  setThreading(mode: "single" | "multi"): void {
+    if (this.session) this.session.threading = mode;
   }
 
-  setModelFingerprint(fp: ModelFingerprint | null): void {
+  setModel(sha256: string, url: string): void {
     if (!this.session) return;
-    this.session.modelFingerprint = fp;
+    this.session.modelFingerprintSha256 = sha256;
+    this.session.modelUrl = url;
   }
 
-  setThreadingMode(mode: "single" | "multi" | "unknown"): void {
-    if (!this.session) return;
-    this.session.threadingMode = mode;
+  setModelLoadMs(ms: number): void {
+    if (this.session) this.session.modelLoadMs = ms;
   }
 
-  setVideoSource(name: string | undefined, targetFps: number): void {
-    if (!this.session) return;
-    this.session.videoSourceName = name;
-    this.session.targetFps = targetFps;
+  setHardware(hardware: HardwareInfo): void {
+    if (this.session) this.session.hardware = hardware;
   }
 
-  /** Beim Finalisieren gesetzt — Videolänge + erwartete Frame-Anzahl. */
-  setVideoMeta(durationSeconds: number, expectedFrames: number): void {
+  setTargetFps(fps: number): void {
+    if (this.session) this.session.targetFps = fps;
+  }
+
+  /** Beim Finalisieren gesetzt — Videolänge + Gesamt-Frame-Zahl (== frames + dropped). */
+  setVideoMeta(durationSec: number, totalFrames: number): void {
     if (!this.session) return;
-    this.session.durationSeconds = durationSeconds;
-    this.session.expectedFrames = expectedFrames;
+    this.session.videoDurationSec = durationSec;
+    this.session.videoTotalFrames = totalFrames;
   }
 
   recordFrame(measurement: FrameMeasurement): void {
-    if (!this.session) return;
-    this.session.frames.push(measurement);
+    if (this.session) this.session.frames.push(measurement);
+  }
+
+  recordDropped(dropped: DroppedFrame): void {
+    if (this.session) this.session.droppedFrames.push(dropped);
   }
 
   exportJSON(): string {
@@ -139,6 +147,13 @@ export class BenchmarkExporter {
     return JSON.stringify(this.session, null, 2);
   }
 
+  /** Vertrag-konformer Dateiname der aktuellen Session (leer ohne Session). */
+  getFilename(): string {
+    if (!this.session) return "";
+    const stamp = toCompactTimestamp(this.session.createdAt);
+    return `benchmark_${this.session.probandId}_${this.session.level}_${stamp}.json`;
+  }
+
   downloadJSON(): void {
     if (!this.session) return;
 
@@ -146,8 +161,7 @@ export class BenchmarkExporter {
     const blob = new Blob([json], { type: "application/json" });
     const url = URL.createObjectURL(blob);
 
-    const timestamp = this.session.startTimestamp.replace(/[:.]/g, "-");
-    const filename = `benchmark_${this.session.participantId}_${this.session.quantizationLevel}_${timestamp}.json`;
+    const filename = this.getFilename();
 
     const a = document.createElement("a");
     a.href = url;
