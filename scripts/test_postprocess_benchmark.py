@@ -18,6 +18,7 @@ import unittest
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from postprocess import accuracy, angles, cycles, gt_tracker, latency, schema  # noqa: E402
+from postprocess import keypoint_quality as kq  # noqa: E402
 from postprocess.cli import build_parser  # noqa: E402
 from postprocess.report import run as report_run  # noqa: E402
 
@@ -84,6 +85,31 @@ def write_session(directory, session):
     with open(path, "w", encoding="utf-8") as fh:
         json.dump(session, fh)
     return path
+
+
+def make_environment():
+    """Minimaler v1.1.0-environment-Block (wie vom Browser-Exporter erzeugt)."""
+    return {
+        "capturedAt": "2026-07-04T12:01:00.000Z",
+        "crossOriginIsolated": True,
+        "hardwareConcurrency": 8,
+        "deviceMemoryGb": 8,
+        "numThreads": 4,
+        "threadingMode": "multi",
+        "tfjs": {
+            "core": "4.22.0", "backendWasm": "4.22.0",
+            "backendWebgl": "4.22.0", "converter": "4.22.0",
+            "tflite": "0.0.1-alpha.9", "poseDetection": "2.1.3",
+        },
+        "userAgentData": {
+            "platform": "macOS", "platformVersion": "14.5.0",
+            "uaFullVersion": "126.0.0.0", "model": "",
+            "architecture": "arm", "bitness": "64",
+        },
+        "battery": {"level": 1.0, "charging": True},
+        "power": {"acPower": True, "lowPowerModeOff": True,
+                  "batteryPercentNote": 100},
+    }
 
 
 def write_tracker(path, n=120, bias=2.0):
@@ -175,6 +201,25 @@ class SchemaTest(unittest.TestCase):
         s["droppedFrames"] = [{"frameIndex": 3, "reason": "seek_timeout"}]
         s["videoTotalFrames"] = len(s["frames"]) + 1
         schema.validate_session(s)  # darf nicht werfen
+
+    def test_schema_11_with_environment(self):
+        s = make_session()
+        s["schemaVersion"] = "1.1.0"
+        s["environment"] = make_environment()
+        schema.validate_session(s)  # kein Raise
+
+    def test_schema_environment_not_object(self):
+        s = make_session()
+        s["schemaVersion"] = "1.1.0"
+        s["environment"] = "nope"
+        with self.assertRaises(schema.SchemaError):
+            schema.validate_session(s)
+
+    def test_unsupported_schema_version(self):
+        s = make_session()
+        s["schemaVersion"] = "2.0.0"
+        with self.assertRaises(schema.SchemaError):
+            schema.validate_session(s)
 
     def test_filename_level_parse(self):
         self.assertEqual(
@@ -324,6 +369,93 @@ class CyclesTest(unittest.TestCase):
 # --------------------------------------------------------------------------- #
 # Integration (report.run end-to-end)
 # --------------------------------------------------------------------------- #
+class KeypointQualityTest(unittest.TestCase):
+    def test_frame_scores(self):
+        s = make_session(n=10, warmup=2)
+        df = schema.frame_scores(s, {"hip": 11, "knee": 13, "ankle": 15})
+        self.assertEqual(
+            list(df.columns),
+            ["frameIndex", "isWarmup", "score_hip", "score_knee", "score_ankle"],
+        )
+        self.assertEqual(len(df), 10)
+        self.assertTrue((df["score_ankle"] == 0.9).all())
+        self.assertEqual(int(df["isWarmup"].sum()), 2)
+
+    def test_score_validation_rejects_nonnumber(self):
+        s = make_session(n=3, warmup=0)
+        s["frames"][0]["keypointScores"][5] = "x"
+        with self.assertRaises(schema.SchemaError):
+            schema.validate_session(s)
+
+    def test_keypoint_quality_rows(self):
+        import pandas as pd
+        sdf = pd.DataFrame({
+            "frameIndex": range(4), "isWarmup": [False] * 4,
+            "score_hip": [0.9, 0.9, 0.9, 0.9],
+            "score_knee": [0.8, 0.8, 0.8, 0.8],
+            "score_ankle": [0.1, 0.2, 0.6, 0.7],  # 2 < 0.5
+        })
+        rows = kq.keypoint_quality_rows("int8", "multi", 0, sdf, "left", 0.5)
+        self.assertEqual(len(rows), 3)
+        by_name = {r["keypoint_name"]: r for r in rows}
+        self.assertEqual(set(by_name), {"lhip", "lknee", "lankle"})
+        self.assertEqual(by_name["lankle"]["keypoint_idx"], 15)
+        self.assertEqual(by_name["lankle"]["n_frames_low_conf"], 2)
+        self.assertAlmostEqual(by_name["lankle"]["pct_frames_low_conf"], 50.0)
+        self.assertEqual(by_name["lhip"]["n_frames_low_conf"], 0)
+
+    def test_session_score_summary(self):
+        import pandas as pd
+        sdf = pd.DataFrame({
+            "frameIndex": range(2), "isWarmup": [False, False],
+            "score_hip": [0.5, 0.7], "score_knee": [0.4, 0.6],
+            "score_ankle": [0.2, 0.8],  # 1 < 0.5 -> 50%
+        })
+        out = kq.session_score_summary(sdf, "left", 0.5)
+        self.assertAlmostEqual(out["lhip_mean_score"], 0.6)
+        self.assertAlmostEqual(out["lankle_mean_score"], 0.5)
+        self.assertAlmostEqual(out["pct_lankle_below_0_5"], 50.0)
+
+    def test_summary_score_columns(self):
+        self.assertEqual(
+            kq.summary_score_columns("left"),
+            ["lhip_mean_score", "lknee_mean_score", "lankle_mean_score",
+             "pct_lankle_below_0_5"],
+        )
+        self.assertEqual(kq.summary_score_columns("right")[-1],
+                         "pct_rankle_below_0_5")
+
+    def test_weighted_mae(self):
+        self.assertAlmostEqual(kq.weighted_mae([2.0, 4.0], [1.0, 3.0]), 3.5)
+        self.assertTrue(math.isnan(kq.weighted_mae([2.0, 4.0], [0.0, 0.0])))
+        self.assertTrue(math.isnan(kq.weighted_mae([], [])))
+
+    def test_pearson_r(self):
+        self.assertAlmostEqual(kq.pearson_r([1, 2, 3, 4], [4, 3, 2, 1]), -1.0)
+        self.assertTrue(math.isnan(kq.pearson_r([1, 1, 1], [1, 2, 3])))
+        self.assertTrue(math.isnan(kq.pearson_r([1.0], [2.0])))
+
+    def test_worst_case_frame(self):
+        import pandas as pd
+        df = pd.DataFrame({
+            "frameIndex": [10, 11, 12],
+            "abs_delta": [30.0, 5.0, 40.0],
+            "score_ankle": [0.1, 0.2, 0.9],  # frame 12 hat höchstes Δ, aber Score 0.9
+            "threading": ["multi"] * 3, "runIndex": [0, 0, 0],
+        })
+        wc = kq.worst_case_frame(df, ankle_max=0.3)
+        self.assertEqual(wc["frameIndex"], 10)  # max |Δ| UNTER Schwelle
+        self.assertAlmostEqual(wc["lankle_score"], 0.1)
+        self.assertIn("lankle_score", wc)  # left-Default
+        wc_r = kq.worst_case_frame(df, ankle_max=0.3, side="right")
+        self.assertIn("rankle_score", wc_r)  # right-side Key
+        self.assertNotIn("lankle_score", wc_r)
+        none = kq.worst_case_frame(
+            df.assign(score_ankle=[0.5, 0.6, 0.9]), ankle_max=0.3
+        )
+        self.assertIsNone(none)
+
+
 class ReportIntegrationTest(unittest.TestCase):
     def _args(self, tmp, exports, out, **over):
         argv = [
@@ -357,15 +489,66 @@ class ReportIntegrationTest(unittest.TestCase):
             self.assertEqual(rc, 0)
             for name in ("summary.csv", "summary_aggregated.csv",
                          "run_log.json", "table_ff1.tex", "table_ff2.tex",
-                         "table_ff3.tex", "latency_distribution.png"):
+                         "table_ff3.tex", "latency_distribution.png",
+                         "keypoint_quality.csv", "delta_vs_score.png",
+                         "score_timeseries_fp32.png", "score_hist_fp32.png"):
                 self.assertTrue(
                     os.path.exists(os.path.join(out, name)), f"fehlt: {name}"
                 )
             import pandas as pd
+            report_mod = __import__("postprocess.report", fromlist=["x"])
             summary = pd.read_csv(os.path.join(out, "summary.csv"))
-            self.assertEqual(list(summary.columns),
-                             __import__("postprocess.report", fromlist=["x"]).SUMMARY_COLUMNS)
+            self.assertEqual(
+                list(summary.columns),
+                report_mod.SUMMARY_COLUMNS + kq.summary_score_columns("left"),
+            )
             self.assertEqual(len(summary), 3)  # fp32/fp16/int8 je 1 Lauf
+
+            agg = pd.read_csv(os.path.join(out, "summary_aggregated.csv"))
+            self.assertIn("MAE_weighted", agg.columns)
+            kqdf = pd.read_csv(os.path.join(out, "keypoint_quality.csv"))
+            self.assertEqual(len(kqdf), 9)  # 3 Stufen × 3 Keypoints
+            self.assertEqual(
+                set(kqdf["keypoint_name"]), {"lhip", "lknee", "lankle"}
+            )
+            with open(os.path.join(out, "run_log.json"), encoding="utf-8") as fh:
+                rlog = json.load(fh)
+            self.assertIn("delta_score_correlation", rlog)
+            self.assertIn("worst_case_frames", rlog)
+            self.assertEqual(rlog["params"]["score_threshold"], 0.5)
+            # Pearson r ONLY, kein p_value (bewusste Entscheidung).
+            corr_fp32 = rlog["delta_score_correlation"]["fp32"]
+            self.assertEqual(set(corr_fp32), {"pearson_r"})
+            self.assertNotIn("p_value", corr_fp32)
+            # 1.0.0-Altdaten ohne environment -> keine environment.csv.
+            self.assertFalse(
+                os.path.exists(os.path.join(out, "environment.csv"))
+            )
+
+    def test_end_to_end_environment_csv(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            exports = os.path.join(tmp, "exports")
+            os.makedirs(exports)
+            for level in ("fp32", "fp16", "int8"):
+                s = make_session(level=level)
+                s["schemaVersion"] = "1.1.0"
+                s["environment"] = make_environment()
+                write_session(exports, s)
+            write_tracker(os.path.join(tmp, "gt.txt"), n=120)
+            out = os.path.join(tmp, "results")
+            rc = report_run(self._args(tmp, exports, out))
+            self.assertEqual(rc, 0)
+            import pandas as pd
+            report_mod = __import__("postprocess.report", fromlist=["x"])
+            envp = os.path.join(out, "environment.csv")
+            self.assertTrue(os.path.exists(envp))
+            envdf = pd.read_csv(envp)
+            self.assertEqual(
+                list(envdf.columns), report_mod.ENVIRONMENT_COLUMNS
+            )
+            self.assertEqual(len(envdf), 3)
+            self.assertTrue((envdf["numThreads"] == 4).all())
+            self.assertTrue(bool(envdf["crossOriginIsolated"].all()))
 
     def test_no_sessions_exit3(self):
         with tempfile.TemporaryDirectory() as tmp:

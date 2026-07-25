@@ -14,7 +14,8 @@ from typing import Dict, List, Tuple
 import numpy as np
 import pandas as pd
 
-from . import accuracy, cycles, gt_tracker, latency, plots, schema
+from . import accuracy, cycles, gt_tracker, keypoint_quality as kq
+from . import latency, plots, schema
 from .angles import SIDE_ANGLE_COLUMN
 from .latex import to_latex_decimal_comma
 
@@ -25,6 +26,46 @@ SUMMARY_COLUMNS = [
     "mean_ms", "sd_ms", "median_ms", "mad_ms", "p95_ms", "fps",
     "meets_30fps", "MAE_deg", "RMSE_deg", "meets_rmse_10",
 ]
+
+# environment.csv (nur v1.1.0-Sessions): Reproduzierbarkeit + Thermik/Reihenfolge.
+ENVIRONMENT_COLUMNS = [
+    "source", "level", "threading", "runIndex", "createdAt", "capturedAt",
+    "crossOriginIsolated", "hardwareConcurrency", "numThreads", "threadingMode",
+    "deviceMemoryGb", "tfjs_core", "tfjs_wasm", "tfjs_tflite", "pose_detection",
+    "platform", "platformVersion", "uaFullVersion",
+    "battery_level", "battery_charging",
+    "acPower", "lowPowerModeOff", "batteryPercentNote",
+]
+
+
+def _flatten_environment(session: dict, env: dict) -> dict:
+    """Flacht den environment-Block einer Session für environment.csv ab."""
+    ua = env.get("userAgentData") or {}
+    bat = env.get("battery") or {}
+    tfjs = env.get("tfjs") or {}
+    power = env.get("power") or {}
+    return {
+        "source": os.path.basename(session["_source"]),
+        "level": session["level"], "threading": session["threading"],
+        "runIndex": session["runIndex"], "createdAt": session["createdAt"],
+        "capturedAt": env.get("capturedAt"),
+        "crossOriginIsolated": env.get("crossOriginIsolated"),
+        "hardwareConcurrency": env.get("hardwareConcurrency"),
+        "numThreads": env.get("numThreads"),
+        "threadingMode": env.get("threadingMode"),
+        "deviceMemoryGb": env.get("deviceMemoryGb"),
+        "tfjs_core": tfjs.get("core"), "tfjs_wasm": tfjs.get("backendWasm"),
+        "tfjs_tflite": tfjs.get("tflite"),
+        "pose_detection": tfjs.get("poseDetection"),
+        "platform": ua.get("platform"),
+        "platformVersion": ua.get("platformVersion"),
+        "uaFullVersion": ua.get("uaFullVersion"),
+        "battery_level": bat.get("level"),
+        "battery_charging": bat.get("charging"),
+        "acPower": power.get("acPower"),
+        "lowPowerModeOff": power.get("lowPowerModeOff"),
+        "batteryPercentNote": power.get("batteryPercentNote"),
+    }
 
 
 def _collect_sessions(args) -> Tuple[List[dict], List[str]]:
@@ -92,6 +133,7 @@ def run(args) -> int:
             "proband": args.proband, "gt": args.gt, "gt_format": args.gt_format,
             "gt_frame_offset": args.gt_frame_offset, "side": args.side,
             "warmup": args.warmup, "outlier_k": args.outlier_k,
+            "score_threshold": args.score_threshold,
             "strict": args.strict, "out": args.out,
         },
         "warnings": [], "encoding": None, "filters": {}, "bdc_frames": [],
@@ -165,10 +207,15 @@ def run(args) -> int:
         return 5
 
     side = args.side
+    side_idx = kq.side_indices(side)
     summary_rows = []
     joined_by_key: Dict[SessionKey, pd.DataFrame] = {}
     frames_by_key: Dict[SessionKey, pd.DataFrame] = {}
+    scores_by_key: Dict[SessionKey, pd.DataFrame] = {}
     pangles_parts = []
+    kq_rows: List[dict] = []
+    env_rows: List[dict] = []  # environment.csv (nur v1.1.0-Sessions).
+    js_parts = []  # joined+scores (non-warmup) je Session, für Korrelation/Plot.
     per_session_log = []
 
     for s in sessions:
@@ -184,21 +231,53 @@ def run(args) -> int:
         joined_by_key[key] = joined
         mae, rmse = accuracy.mae_rmse(joined["diff"])
 
-        summary_rows.append(
-            {
-                "level": s["level"], "threading": s["threading"],
-                "runIndex": s["runIndex"],
-                "n_frames": lat["n_frames"], "n_warmup": lat["n_warmup"],
-                "n_outlier": lat["n_outlier"], "mean_ms": lat["mean_ms"],
-                "sd_ms": lat["sd_ms"], "median_ms": lat["median_ms"],
-                "mad_ms": lat["mad_ms"], "p95_ms": lat["p95_ms"],
-                "fps": lat["fps"], "meets_30fps": lat["meets_30fps"],
-                "MAE_deg": mae, "RMSE_deg": rmse,
-                "meets_rmse_10": bool(
-                    np.isfinite(rmse) and rmse < accuracy.RMSE_THRESHOLD
-                ),
-            }
+        # --- Keypoint-Qualität (deskriptiv, additiv) ---
+        sdf = schema.frame_scores(s, side_idx)
+        scores_by_key[key] = sdf
+        kq_rows.extend(
+            kq.keypoint_quality_rows(
+                s["level"], s["threading"], s["runIndex"], sdf, side,
+                args.score_threshold,
+            )
         )
+        score_summary = kq.session_score_summary(sdf, side, args.score_threshold)
+
+        # joined = NON-Warmup (join_session filtert Warmup); keypoint_quality_rows
+        # oben nutzt bewusst ALLE Frames — hier gilt dieselbe Non-Warmup-Menge
+        # wie die frame-weise MAE, damit Gewichte exakt zu den Δ passen.
+        js = joined.merge(
+            sdf.drop(columns=["isWarmup"]), on="frameIndex", how="inner"
+        ).assign(abs_delta=lambda d: d["diff"].abs())
+        weights = js["score_hip"] * js["score_knee"] * js["score_ankle"]
+        mae_weighted = kq.weighted_mae(js["abs_delta"], weights)
+        js_parts.append(
+            js[["frameIndex", "abs_delta",
+                "score_hip", "score_knee", "score_ankle"]].assign(
+                level=s["level"], threading=s["threading"],
+                runIndex=s["runIndex"],
+            )
+        )
+
+        row = {
+            "level": s["level"], "threading": s["threading"],
+            "runIndex": s["runIndex"],
+            "n_frames": lat["n_frames"], "n_warmup": lat["n_warmup"],
+            "n_outlier": lat["n_outlier"], "mean_ms": lat["mean_ms"],
+            "sd_ms": lat["sd_ms"], "median_ms": lat["median_ms"],
+            "mad_ms": lat["mad_ms"], "p95_ms": lat["p95_ms"],
+            "fps": lat["fps"], "meets_30fps": lat["meets_30fps"],
+            "MAE_deg": mae, "RMSE_deg": rmse,
+            "MAE_weighted": mae_weighted,
+            "meets_rmse_10": bool(
+                np.isfinite(rmse) and rmse < accuracy.RMSE_THRESHOLD
+            ),
+        }
+        row.update(score_summary)
+        summary_rows.append(row)
+
+        env = s.get("environment")
+        if isinstance(env, dict):
+            env_rows.append(_flatten_environment(s, env))
 
         nonwarm = fdf[~fdf["isWarmup"]]
         pangles_parts.append(
@@ -233,13 +312,38 @@ def run(args) -> int:
     agg_lat = latency.aggregate_latency(summary_df)
     acc_agg = (
         summary_df.groupby(["level", "threading"], sort=False)
-        .agg(MAE_deg=("MAE_deg", "mean"), RMSE_deg=("RMSE_deg", "mean"))
+        .agg(
+            MAE_deg=("MAE_deg", "mean"),
+            RMSE_deg=("RMSE_deg", "mean"),
+            MAE_weighted=("MAE_weighted", "mean"),
+        )
         .reset_index()
     )
     summary_aggregated = agg_lat.merge(acc_agg, on=["level", "threading"])[
         ["level", "threading", "mean_of_means_ms", "sd_of_means_ms",
-         "MAE_deg", "RMSE_deg"]
+         "MAE_deg", "RMSE_deg", "MAE_weighted"]
     ]
+
+    # --- Joined+Scores (non-warmup) gepoolt: Korrelation + Worst-Case je Stufe ---
+    js_df = (
+        pd.concat(js_parts, ignore_index=True)
+        if js_parts else pd.DataFrame(
+            columns=["frameIndex", "abs_delta", "score_hip", "score_knee",
+                     "score_ankle", "level", "threading", "runIndex"]
+        )
+    )
+    log["delta_score_correlation"] = {}
+    log["worst_case_frames"] = {}
+    for level in schema.LEVELS:
+        sub = js_df[js_df["level"] == level]
+        if sub.empty:
+            continue
+        log["delta_score_correlation"][level] = {
+            "pearson_r": kq.pearson_r(sub["score_ankle"], sub["abs_delta"])
+        }
+        worst = kq.worst_case_frame(sub, side=side)
+        if worst is not None:
+            log["worst_case_frames"][level] = worst
 
     # --- Paarweise Δθ + Bland-Altman (deskriptiv, gepoolt je Stufe) ---
     pangles_df = (
@@ -270,6 +374,7 @@ def run(args) -> int:
     bdc_per_cycle = pd.DataFrame()
     bdc_frames = np.array([], dtype=int)
     rep_joined_by_level: Dict[str, pd.DataFrame] = {}
+    rep_scores_by_level: Dict[str, pd.DataFrame] = {}
     if fp32_base is not None:
         bdc_frames, _, _ = cycles.detect_bdc_frames(joined_by_key[fp32_base])
         log["bdc_frames"] = [int(x) for x in bdc_frames]
@@ -277,6 +382,7 @@ def run(args) -> int:
             rep = _pick_representative(keys, level, prefer=fp32_base)
             if rep is not None:
                 rep_joined_by_level[level] = joined_by_key[rep]
+                rep_scores_by_level[level] = scores_by_key[rep]
         if len(bdc_frames) >= 2 and rep_joined_by_level:
             cycle_summary, bdc_per_cycle = cycles.cycle_metrics(
                 bdc_frames, rep_joined_by_level
@@ -289,6 +395,7 @@ def run(args) -> int:
         cycle_summary, bdc_per_cycle, cycle_agg, joined_by_level,
         rep_joined_by_level, frames_by_key, ba_by_level,
         delta_fp16, delta_int8, bdc_frames, log,
+        kq_rows, js_df, rep_scores_by_level, env_rows,
     )
 
     print(f"OK: {len(sessions)} Sessions ausgewertet → {args.out}")
@@ -302,12 +409,21 @@ def _write_outputs(
     cycle_summary, bdc_per_cycle, cycle_agg, joined_by_level,
     rep_joined_by_level, frames_by_key, ba_by_level,
     delta_fp16, delta_int8, bdc_frames, log,
+    kq_rows, js_df, rep_scores_by_level, env_rows,
 ) -> None:
     out = args.out
 
-    summary_df.reindex(columns=SUMMARY_COLUMNS).to_csv(
+    score_cols = kq.summary_score_columns(args.side)
+    summary_df.reindex(columns=SUMMARY_COLUMNS + score_cols).to_csv(
         os.path.join(out, "summary.csv"), index=False
     )
+    pd.DataFrame(
+        kq_rows, columns=kq.KEYPOINT_QUALITY_COLUMNS
+    ).to_csv(os.path.join(out, "keypoint_quality.csv"), index=False)
+    if env_rows:
+        pd.DataFrame(env_rows, columns=ENVIRONMENT_COLUMNS).to_csv(
+            os.path.join(out, "environment.csv"), index=False
+        )
     summary_aggregated.to_csv(
         os.path.join(out, "summary_aggregated.csv"), index=False
     )
@@ -369,6 +485,21 @@ def _write_outputs(
     plots.delta_hist(
         os.path.join(out, "delta_hist_int8_vs_fp32.png"),
         "INT8 − FP32", delta_int8,
+    )
+
+    # Keypoint-Qualität (deskriptiv): Score-Zeitreihe + Histogramm je Stufe.
+    names = kq.SIDE_KEYPOINT_NAMES[args.side]
+    for level, sdf in rep_scores_by_level.items():
+        plots.score_timeseries(
+            os.path.join(out, f"score_timeseries_{level}.png"),
+            level, sdf, args.score_threshold, names,
+        )
+        plots.score_hist(
+            os.path.join(out, f"score_hist_{level}.png"),
+            level, sdf, args.score_threshold, names,
+        )
+    plots.delta_vs_score(
+        os.path.join(out, "delta_vs_score.png"), js_df, ankle_label=names["ankle"]
     )
 
     _write_latex(
