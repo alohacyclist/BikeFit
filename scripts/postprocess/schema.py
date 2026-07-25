@@ -13,7 +13,9 @@ from typing import Any, Optional
 
 import pandas as pd
 
-SCHEMA_VERSION = "1.0.0"
+SCHEMA_VERSION = "1.1.0"
+# 1.0.0 = ohne environment-Block (Altdaten), 1.1.0 = mit. Beide gültig.
+SUPPORTED_SCHEMA_VERSIONS = ("1.0.0", "1.1.0")
 LEVELS = ("fp32", "fp16", "int8")
 SIDES = ("left", "right")
 THREADINGS = ("single", "multi")
@@ -104,6 +106,11 @@ def _validate_frame(frame: Any, i: int, source: str) -> None:
         raise SchemaError(
             f"{source}: frames[{i}].keypointScores muss Länge {KEYPOINT_COUNT} haben."
         )
+    for j, sc in enumerate(scores):
+        if not _is_number(sc):
+            raise SchemaError(
+                f"{source}: frames[{i}].keypointScores[{j}] ist keine Zahl."
+            )
 
 
 def validate_session(session: Any, source: str = "<session>") -> None:
@@ -115,11 +122,13 @@ def validate_session(session: Any, source: str = "<session>") -> None:
         if key not in session:
             raise SchemaError(f"{source}: Pflichtfeld '{key}' fehlt.")
 
-    if session["schemaVersion"] != SCHEMA_VERSION:
+    if session["schemaVersion"] not in SUPPORTED_SCHEMA_VERSIONS:
         raise SchemaError(
             f"{source}: schemaVersion {session['schemaVersion']!r} "
-            f"!= {SCHEMA_VERSION!r}."
+            f"nicht in {SUPPORTED_SCHEMA_VERSIONS}."
         )
+    if "environment" in session and not isinstance(session["environment"], dict):
+        raise SchemaError(f"{source}: 'environment' ist kein Objekt.")
     if session["level"] not in LEVELS:
         raise SchemaError(f"{source}: level {session['level']!r} ungültig.")
     if session["bodySide"] not in SIDES:
@@ -191,6 +200,25 @@ def frames_dataframe(session: dict) -> pd.DataFrame:
             "kneeAngleLeft": float(f["kneeAngleLeft"]),
             "kneeAngleRight": float(f["kneeAngleRight"]),
             "isWarmup": bool(f["isWarmup"]),
+        }
+        for f in session["frames"]
+    ]
+    return pd.DataFrame(rows)
+
+
+def frame_scores(session: dict, indices: dict) -> pd.DataFrame:
+    """Per-Frame-Scores der gewählten Keypoints (role→COCO-Index), inkl. Warmup.
+
+    Spalten: frameIndex, isWarmup, score_<role> je role in indices.
+    """
+    rows = [
+        {
+            "frameIndex": int(f["frameIndex"]),
+            "isWarmup": bool(f["isWarmup"]),
+            **{
+                f"score_{role}": float(f["keypointScores"][idx])
+                for role, idx in indices.items()
+            },
         }
         for f in session["frames"]
     ]

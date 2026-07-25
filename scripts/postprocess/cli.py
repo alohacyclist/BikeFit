@@ -40,6 +40,10 @@ def build_parser() -> argparse.ArgumentParser:
         "--outlier-k", type=float, default=3.0,
         help="MAD-Faktor k für den Latenz-Ausreißerfilter (Default 3.0).",
     )
+    parser.add_argument(
+        "--score-threshold", type=float, default=0.5,
+        help="Score-Schwelle für low-confidence-Keypoints (Default 0.5).",
+    )
     parser.add_argument("--out", required=True, help="Ausgabeverzeichnis.")
     parser.add_argument(
         "--strict", action="store_true",
