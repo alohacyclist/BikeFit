@@ -9,6 +9,7 @@ import {
 } from "./services/BenchmarkExporter";
 import { calculateKneeAngle, type BodySide } from "./utils/AngleCalculator";
 import { detectHardware } from "./utils/hardwareInfo";
+import { collectEnvironment } from "./utils/environment";
 import * as videoStore from "./utils/videoStore";
 import {
   readPending,
@@ -27,6 +28,9 @@ const HW_CPU_KEY = "edgefit.hw.cpu";
 const PID_KEY = "edgefit.probandId";
 const SIDE_KEY = "edgefit.bodySide";
 const FPS_KEY = "edgefit.targetFps";
+const AC_KEY = "edgefit.env.acPower";
+const LPM_KEY = "edgefit.env.lowPowerOff";
+const BAT_KEY = "edgefit.env.batteryNote";
 
 // Ganze Sequenz. Der Wechsel INS/AUS int8 deadlockt bei In-Page-Modellwechsel
 // (qu8-Delegate-Swap auf dem page-lifetime-Singleton-Pthread-Pool). Deshalb
@@ -59,6 +63,7 @@ function App() {
     setThreadingPreference,
     multiThreadingAvailable,
     activeThreadingMode,
+    activeNumThreads,
   } = usePoseDetection(initialLevel);
 
   const [participantId, setParticipantId] = useState(
@@ -77,6 +82,16 @@ function App() {
     () => localStorage.getItem(HW_DEVICE_KEY) ?? "",
   );
   const [cpu, setCpu] = useState(() => localStorage.getItem(HW_CPU_KEY) ?? "");
+  // Manuelle Env-Felder (nicht JS-lesbar). Default: AC an, Low Power aus.
+  const [acPower, setAcPower] = useState(
+    () => localStorage.getItem(AC_KEY) !== "0",
+  );
+  const [lowPowerOff, setLowPowerOff] = useState(
+    () => localStorage.getItem(LPM_KEY) !== "0",
+  );
+  const [batteryNote, setBatteryNote] = useState(
+    () => localStorage.getItem(BAT_KEY) ?? "",
+  );
   const [lastSummary, setLastSummary] = useState<{
     durationSeconds: number;
     expectedFrames: number;
@@ -122,6 +137,18 @@ function App() {
   const changeCpu = useCallback((v: string) => {
     setCpu(v);
     persist(HW_CPU_KEY, v);
+  }, []);
+  const changeAcPower = useCallback((v: boolean) => {
+    setAcPower(v);
+    persist(AC_KEY, v ? "1" : "0");
+  }, []);
+  const changeLowPowerOff = useCallback((v: boolean) => {
+    setLowPowerOff(v);
+    persist(LPM_KEY, v ? "1" : "0");
+  }, []);
+  const changeBatteryNote = useCallback((v: string) => {
+    setBatteryNote(v);
+    persist(BAT_KEY, v);
   }, []);
 
   // runIndex je (Proband × Threading) persistieren.
@@ -315,6 +342,19 @@ function App() {
     async (durationSeconds: number, totalFrames: number) => {
       benchmarkExporter.setVideoMeta(durationSeconds, totalFrames);
       benchmarkExporter.setModelLoadMs(modelLoadMsRef.current ?? 0);
+      // Umgebungsblock (v1.1.0): tatsächliche numThreads/COI/Versionen/Batterie
+      // erst hier erfassen — Modell ist geladen, activeNumThreads steht fest.
+      const batteryNum = batteryNote.trim() ? Number(batteryNote.trim()) : NaN;
+      const env = await collectEnvironment(
+        activeNumThreads,
+        activeThreadingMode === "multi" ? "multi" : "single",
+        {
+          acPower,
+          lowPowerModeOff: lowPowerOff,
+          batteryPercentNote: Number.isFinite(batteryNum) ? batteryNum : null,
+        },
+      );
+      benchmarkExporter.setEnvironment(env);
       setLastSummary({ durationSeconds, expectedFrames: totalFrames });
 
       if (!sequenceActive) {
@@ -357,7 +397,18 @@ function App() {
         }
       }
     },
-    [sequenceActive, currentLevel, goToLevel, bumpRunIndex, modelLoadMsRef],
+    [
+      sequenceActive,
+      currentLevel,
+      goToLevel,
+      bumpRunIndex,
+      modelLoadMsRef,
+      activeNumThreads,
+      activeThreadingMode,
+      acPower,
+      lowPowerOff,
+      batteryNote,
+    ],
   );
 
   const handleDroppedFrame = useCallback(
@@ -489,6 +540,12 @@ function App() {
               onDeviceChange={changeDevice}
               cpu={cpu}
               onCpuChange={changeCpu}
+              acPower={acPower}
+              onAcPowerChange={changeAcPower}
+              lowPowerOff={lowPowerOff}
+              onLowPowerOffChange={changeLowPowerOff}
+              batteryNote={batteryNote}
+              onBatteryNoteChange={changeBatteryNote}
               onExport={handleExport}
               forcedSide={forcedSide}
               onForcedSideChange={changeForcedSide}
