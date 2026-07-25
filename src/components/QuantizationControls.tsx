@@ -17,6 +17,13 @@ interface QuantizationControlsProps {
   onDeviceChange: (value: string) => void;
   cpu: string;
   onCpuChange: (value: string) => void;
+  /** Manuelle Env-Felder (nicht JS-lesbar) — Netzbetrieb / Low Power / Akku %. */
+  acPower: boolean;
+  onAcPowerChange: (value: boolean) => void;
+  lowPowerOff: boolean;
+  onLowPowerOffChange: (value: boolean) => void;
+  batteryNote: string;
+  onBatteryNoteChange: (value: string) => void;
   onExport: () => void;
 
   /** Side-Lock — Studienleiter setzt fest vor Messung. */
@@ -57,6 +64,12 @@ export function QuantizationControls({
   onDeviceChange,
   cpu,
   onCpuChange,
+  acPower,
+  onAcPowerChange,
+  lowPowerOff,
+  onLowPowerOffChange,
+  batteryNote,
+  onBatteryNoteChange,
   onExport,
   forcedSide,
   onForcedSideChange,
@@ -247,6 +260,45 @@ export function QuantizationControls({
           Leer = Auto-Erkennung aus User-Agent. Für FF3 (Latenz) präzise Angabe
           empfohlen.
         </p>
+      </div>
+
+      {/* Manuelle Umgebungsangaben (nicht JS-lesbar) — Reproduzierbarkeit FF3 */}
+      <div className="grid grid-cols-1 gap-2 border-t border-gray-700 pt-3">
+        <label className="flex items-center gap-2 text-xs text-gray-300">
+          <input
+            type="checkbox"
+            checked={acPower}
+            onChange={(e) => onAcPowerChange(e.target.checked)}
+            disabled={disabled}
+            className="accent-blue-500"
+          />
+          Am Netz (AC) bestätigt
+        </label>
+        <label className="flex items-center gap-2 text-xs text-gray-300">
+          <input
+            type="checkbox"
+            checked={lowPowerOff}
+            onChange={(e) => onLowPowerOffChange(e.target.checked)}
+            disabled={disabled}
+            className="accent-blue-500"
+          />
+          Low Power Mode aus
+        </label>
+        <div>
+          <label className="block text-xs text-gray-400 mb-1">
+            Batteriestand % (Notiz)
+          </label>
+          <input
+            type="number"
+            min={0}
+            max={100}
+            value={batteryNote}
+            onChange={(e) => onBatteryNoteChange(e.target.value)}
+            placeholder="z.B. 100"
+            disabled={disabled}
+            className="w-full px-3 py-2 rounded-md bg-gray-900 border border-gray-700 text-sm text-gray-200 focus:outline-none focus:border-blue-500 disabled:opacity-50"
+          />
+        </div>
       </div>
 
       {isWarmingUp && (

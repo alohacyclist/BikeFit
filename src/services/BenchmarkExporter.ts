@@ -12,8 +12,9 @@ import { QuantizationLevel, WARMUP_FRAMES } from "../types/quantization";
 import type { BodySide } from "../utils/AngleCalculator";
 import { detectHardware, toCompactTimestamp } from "../utils/hardwareInfo";
 import type { HardwareInfo } from "../utils/hardwareInfo";
+import type { EnvironmentInfo } from "../utils/environment";
 
-export const SCHEMA_VERSION = "1.0.0" as const;
+export const SCHEMA_VERSION = "1.1.0" as const;
 
 export interface Point2D {
   x: number;
@@ -64,6 +65,8 @@ export interface BenchmarkSession {
   modelLoadMs: number;
   userAgent: string;
   hardware: HardwareInfo;
+  /** v1.1.0: Umgebungs-/Reproduzierbarkeitsblock (optional bei Altdaten 1.0.0). */
+  environment?: EnvironmentInfo;
   frames: FrameMeasurement[];
   droppedFrames: DroppedFrame[];
 }
@@ -119,6 +122,10 @@ export class BenchmarkExporter {
 
   setHardware(hardware: HardwareInfo): void {
     if (this.session) this.session.hardware = hardware;
+  }
+
+  setEnvironment(environment: EnvironmentInfo): void {
+    if (this.session) this.session.environment = environment;
   }
 
   setTargetFps(fps: number): void {
