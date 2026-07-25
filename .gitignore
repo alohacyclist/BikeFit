@@ -14,3 +14,4 @@ __pycache__/
 # Post-processing output / throwaway artifacts
 ergebnisse.json
 results/
+BikeFit_Session_Exports/
