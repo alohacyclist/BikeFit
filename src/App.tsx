@@ -23,14 +23,14 @@ import {
   type QuantizationLevel,
 } from "./types/quantization";
 
-const HW_DEVICE_KEY = "edgefit.hw.device";
-const HW_CPU_KEY = "edgefit.hw.cpu";
-const PID_KEY = "edgefit.probandId";
-const SIDE_KEY = "edgefit.bodySide";
-const FPS_KEY = "edgefit.targetFps";
-const AC_KEY = "edgefit.env.acPower";
-const LPM_KEY = "edgefit.env.lowPowerOff";
-const BAT_KEY = "edgefit.env.batteryNote";
+const HW_DEVICE_KEY = "bikefit.hw.device";
+const HW_CPU_KEY = "bikefit.hw.cpu";
+const PID_KEY = "bikefit.probandId";
+const SIDE_KEY = "bikefit.bodySide";
+const FPS_KEY = "bikefit.targetFps";
+const AC_KEY = "bikefit.env.acPower";
+const LPM_KEY = "bikefit.env.lowPowerOff";
+const BAT_KEY = "bikefit.env.batteryNote";
 
 // Ganze Sequenz. Der Wechsel INS/AUS int8 deadlockt bei In-Page-Modellwechsel
 // (qu8-Delegate-Swap auf dem page-lifetime-Singleton-Pthread-Pool). Deshalb
@@ -152,7 +152,7 @@ function App() {
   }, []);
 
   // runIndex je (Proband × Threading) persistieren.
-  const runKey = `edgefit.runIndex.${participantId}.${threadingPreference}`;
+  const runKey = `bikefit.runIndex.${participantId}.${threadingPreference}`;
   const runKeyRef = useRef(runKey);
   useEffect(() => {
     runKeyRef.current = runKey;
@@ -464,7 +464,7 @@ function App() {
           <div className="flex items-center justify-between">
             <div>
               <h1 className="text-2xl font-bold text-white">
-                EdgeFit <span className="text-green-400">Pro</span>
+                Bike<span className="text-green-400">Fit</span>
               </h1>
               <p className="text-sm text-gray-400">
                 Kniewinkel-Messung · Quantisierungs-Benchmark
@@ -668,7 +668,7 @@ function App() {
 
       <footer className="mt-8 border-t border-gray-800 bg-gray-900/50">
         <div className="max-w-7xl mx-auto px-4 py-4 text-center text-xs text-gray-500">
-          EdgeFit Pro · Bachelorarbeit FOM · TFLite + React
+          BikeFit · Bachelorarbeit FOM · TFLite + React
         </div>
       </footer>
     </div>

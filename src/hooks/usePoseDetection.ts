@@ -159,7 +159,7 @@ export function usePoseDetection(
   const persistedThreading =
     typeof sessionStorage !== "undefined"
       ? (sessionStorage.getItem(
-          "edgefit.threading",
+          "bikefit.threading",
         ) as ThreadingPreference | null)
       : null;
   const initialThreading: ThreadingPreference =
@@ -175,7 +175,7 @@ export function usePoseDetection(
     (mode: ThreadingPreference) => {
       if (mode === threadingPreference) return;
       try {
-        sessionStorage.setItem("edgefit.threading", mode);
+        sessionStorage.setItem("bikefit.threading", mode);
       } catch {
         // Storage nicht verfügbar → trotzdem reloaden, Init nutzt Default
       }
