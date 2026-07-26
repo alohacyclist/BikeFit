@@ -11,7 +11,7 @@
  *     (Button-Klick) herunterladen — nicht automatisch nach jedem Reload.
  */
 
-const DB_NAME = "edgefit";
+const DB_NAME = "bikefit";
 const DB_VERSION = 2;
 const VIDEO_STORE = "video";
 const RESULT_STORE = "results";

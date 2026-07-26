@@ -1,4 +1,4 @@
-# EdgeFit Pro
+# BikeFit
 
 Bachelor-thesis measurement app. Browser-only knee-angle measurement via TensorFlow.js **TFLite** MoveNet (SinglePose Lightning, WASM backend) across **three post-training quantization levels (fp32 / fp16 / int8)**. Accuracy is validated per frame against an external 2D video-analysis tool (ground truth).
 

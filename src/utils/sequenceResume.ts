@@ -9,7 +9,7 @@
 
 import type { QuantizationLevel } from "../types/quantization";
 
-const KEY = "edgefit.pendingBoot";
+const KEY = "bikefit.pendingBoot";
 const LEVELS: QuantizationLevel[] = ["fp32", "fp16", "int8"];
 
 export interface PendingBoot {
