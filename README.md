@@ -17,7 +17,48 @@ Bachelor-thesis measurement app. Browser-only knee-angle measurement via TensorF
 - `@tensorflow/tfjs-core` / `-backend-wasm` / `-backend-webgl` / `-converter` 4.22.0
 - `@tensorflow-models/pose-detection` 2.1.3 (types only)
 
-All versions are pinned (no caret) for reproducibility. `.npmrc` sets `legacy-peer-deps=true` because of the TFLite-alpha peer ranges.
+Runtime tfjs/tflite dependencies are exact-pinned (no caret) for reproducibility. `.npmrc` sets `legacy-peer-deps=true` because of the TFLite-alpha peer ranges.
+
+## Installation
+
+**Prerequisites**
+
+- Node.js 18+ (Vite 6 requirement; developed on 20.19.5) + npm
+- Python 3.11+ for the postprocessing (pandas 3.0 / numpy 2.4 floor; developed on 3.13)
+- ffmpeg for CFR conversion (developed on 8.0)
+
+**Web app**
+
+```bash
+npm install                 # .npmrc already sets legacy-peer-deps=true
+# place the three .tflite models into public/models/ (see "Model paths")
+npm run measure             # build + preview on http://localhost:4173
+```
+
+**Python postprocessing**
+
+```bash
+pip install -r scripts/requirements.txt
+```
+
+### Tested versions
+
+| Component | Version |
+|---|---|
+| Node.js / npm | 20.19.5 / 10.8.2 |
+| React / React-DOM | 18.3.1 |
+| TypeScript | 5.6.3 |
+| Vite | 6.0.3 |
+| TailwindCSS | 3.4.16 |
+| PostCSS / autoprefixer | 8.4.49 / 10.4.20 |
+| `@tensorflow/tfjs-core` / `-backend-wasm` / `-backend-webgl` / `-converter` | 4.22.0 |
+| `@tensorflow/tfjs-tflite` | 0.0.1-alpha.9 |
+| `@tensorflow-models/pose-detection` | 2.1.3 |
+| Python | 3.13.0 |
+| numpy / scipy / pandas / matplotlib | 2.4.1 / 1.17.1 / 3.0.1 / 3.11.0 |
+| ffmpeg | 8.0 |
+
+The tfjs/tflite runtime deps are exact-pinned in `package.json`; the build/dev deps (TypeScript, Vite, Tailwind, PostCSS, autoprefixer) use caret ranges — the table lists the resolved versions actually used.
 
 ## Scripts
 
@@ -205,7 +246,7 @@ Download from [Kaggle MoveNet TFLite](https://www.kaggle.com/models/google/moven
 
 ## Python postprocessing
 
-Package `scripts/postprocess/` (many small modules) with the CLI wrapper `scripts/postprocess_benchmark.py`. Consumes the three quantization JSONs of a full sequence plus the tracker ground truth and computes FF1/FF2/FF3. Requires `numpy`, `scipy`, `pandas`, `matplotlib`.
+Package `scripts/postprocess/` (many small modules) with the CLI wrapper `scripts/postprocess_benchmark.py`. Consumes the three quantization JSONs of a full sequence plus the tracker ground truth and computes FF1/FF2/FF3. Dependencies: `pip install -r scripts/requirements.txt` (numpy, scipy, pandas, matplotlib).
 
 ```bash
 python3 scripts/postprocess_benchmark.py \
